@@ -40,25 +40,22 @@ balance_controller:
 pid_tuner:
   ros__parameters:
     # --- Relay Feedback ---
-    relay_amplitude: 0.3        # Biên độ relay (m/s). Lớn hơn = dao động mạnh hơn
-    stabilizing_kp: 30.0        # Kp ổn định cơ bản (giữ robot không ngã khi tune)
-    stabilizing_kd: 3.0         # Kd ổn định cơ bản
+    relay_amplitude: 0.3        # Biên độ relay (m/s)
+    stabilizing_kp: 35.0        # Kp ổn định cơ bản
+    stabilizing_kd: 4.0         # Kd ổn định cơ bản
 
     # --- Đo lường ---
-    num_cycles: 6               # Số chu kỳ dao động cần đo (nhiều hơn = chính xác hơn)
+    num_cycles: 5               # Số chu kỳ dao động cần đo
+    max_iterations: 3           # Tự động reset và lấy mẫu 3 lần để chọn bộ tối ưu
 
-    # --- Quy tắc Ziegler-Nichols ---
-    # Chọn 1 trong: 'classic', 'some_overshoot', 'no_overshoot', 'pessen'
-    #   classic:         Đáp ứng nhanh, vọt lố ~25%
-    #   some_overshoot:  Cân bằng tốc độ/ổn định, vọt lố ~15%
-    #   no_overshoot:    Ổn định nhất, đáp ứng chậm hơn
-    #   pessen:          Đáp ứng nhanh nhất, vọt lố cao
-    zn_rule: 'some_overshoot'
+    # --- Quy tắc tối ưu cho xe cân bằng ---
+    # Chọn: 'balance_optimized' (khuyên dùng), 'balance_stiff', 'balance_smooth'
+    zn_rule: 'balance_optimized'
 
     # --- Thời gian ---
-    stabilize_duration: 3.0     # Thời gian ổn định ban đầu (s)
+    stabilize_duration: 2.5     # Thời gian ổn định ban đầu (s)
     verify: true                # Có kiểm nghiệm kết quả không
-    verify_duration: 8.0        # Thời gian kiểm nghiệm (s)
+    verify_duration: 6.0        # Thời gian kiểm nghiệm mỗi vòng (s)
 
     # --- An toàn ---
     fall_threshold: 0.785       # Ngưỡng ngã (rad)
