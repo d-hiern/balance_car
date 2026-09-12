@@ -244,6 +244,7 @@ class PsoPIDTunerNode(Node):
             # Thêm điểm làm ngã vào Blacklist để lần sau không bao giờ thử lại
             bad_pos = list(self.particles[self.current_particle_idx].position)
             self.blacklist.append(bad_pos)
+            self._save_memory()  # Lưu ngay lập tức vào ổ đĩa
             self.get_logger().warn(
                 f'  ⚠️ Cá thể #{self.current_particle_idx + 1} làm ngã xe (Pitch = {math.degrees(pitch):.1f}°)! '
                 f'Đã đưa vào Blacklist 🚫'
@@ -349,6 +350,7 @@ class PsoPIDTunerNode(Node):
             if final_pitch_deg > 4.5 and not self.robot_fell:
                 bad_pos = list(particle.position)
                 self.blacklist.append(bad_pos)
+                self._save_memory()  # Lưu ngay vào file nhớ
                 self.get_logger().warn(
                     f'    ⚠️ Hết giờ nhưng xe chưa hồi phục (Góc cuối = {final_pitch_deg:.1f}° > 4.5°)! Bị loại 🚫'
                 )
