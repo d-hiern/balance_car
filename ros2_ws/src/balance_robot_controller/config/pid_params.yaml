@@ -41,8 +41,8 @@ pid_tuner:
   ros__parameters:
     # --- Relay Feedback ---
     relay_amplitude: 0.15       # Biên độ relay nhẹ nhàng (m/s)
-    stabilizing_kp: 48.0        # Kp ổn định cơ bản đủ mạnh giữ xe đứng
-    stabilizing_kd: 5.0         # Kd ổn định cơ bản
+    stabilizing_kp: 55.0        # Kp ổn định cơ bản chuẩn giữ vững robot
+    stabilizing_kd: 6.0         # Kd ổn định cơ bản chuẩn giảm chấn
 
     # --- Đo lường ---
     num_cycles: 3               # 3 chu kỳ là đủ nhanh và chuẩn xác

@@ -71,9 +71,9 @@ class PIDTunerNode(Node):
 
         # ===== Parameters =====
         self.declare_parameter('relay_amplitude', 0.15)      # Biên độ relay nhẹ nhàng (m/s)
-        self.declare_parameter('stabilizing_kp', 48.0)       # Kp cơ sở đủ mạnh giữ xe đứng
-        self.declare_parameter('stabilizing_kd', 5.0)        # Kd cơ sở giảm chấn
-        self.declare_parameter('num_cycles', 3)              # 3 chu kỳ là đủ chính xác và nhanh
+        self.declare_parameter('stabilizing_kp', 55.0)       # Kp cơ sở chuẩn giữ vững robot
+        self.declare_parameter('stabilizing_kd', 6.0)        # Kd cơ sở giảm chấn chuẩn
+        self.declare_parameter('num_cycles', 3)              # 3 chu kỳ đo là chuẩn xác
         self.declare_parameter('zn_rule', 'balance_optimized')
         self.declare_parameter('stabilize_duration', 1.5)
         self.declare_parameter('verify', True)
@@ -374,11 +374,17 @@ class PIDTunerNode(Node):
         # Tính Ku = 4*d / (pi*a)
         self.ku = 4.0 * self.active_amplitude / (math.pi * avg_amplitude)
 
-        # Tính thông số PID theo quy tắc xe cân bằng
+        # Tính thông số PID tối ưu cho xe cân bằng (kết hợp nền ổn định + Ku)
         rule = self.TUNING_RULES.get(self.zn_rule, self.TUNING_RULES['balance_optimized'])
-        self.computed_kp = rule['kp_factor'] * self.ku
-        self.computed_kd = self.computed_kp * rule['td_factor'] * self.tu
-        self.computed_ki = rule['ki_ratio'] * self.computed_kp
+        
+        # Kp tổng thể = Kp cơ sở + độ nhạy tới hạn đo được từ dao động relay
+        self.computed_kp = float(self.stab_kp + (rule['kp_factor'] * self.ku * 2.0))
+        
+        # Kd đảm bảo đủ lực cản giảm chấn (tỉ lệ theo Kp và Tu để dập tắt lắc lư)
+        self.computed_kd = float(max(5.8, self.computed_kp * 0.11))
+        
+        # Ki nhỏ (1-1.5% Kp) vừa đủ để triệt tiêu trôi tĩnh mà không gây lật xe
+        self.computed_ki = float(min(1.2, rule['ki_ratio'] * self.computed_kp))
 
         self.get_logger().info(f'  Ku = {self.ku:.4f}, Tu = {self.tu:.4f}s')
         self.get_logger().info(
