@@ -1,0 +1,68 @@
+# =============================================
+# Cấu hình PID cho xe cân bằng hai bánh
+# =============================================
+# Các giá trị mặc định này là điểm khởi đầu hợp lý.
+# Dùng pid_tuner để tìm giá trị tối ưu cho robot của bạn.
+#
+# Thay đổi runtime:
+#   ros2 param set /balance_controller kp 60.0
+#   ros2 param set /balance_controller ki 1.0
+#   ros2 param set /balance_controller kd 8.0
+# =============================================
+
+balance_controller:
+  ros__parameters:
+    # --- Hệ số PID ---
+    kp: 50.0              # Proportional - phản ứng tỉ lệ với sai số
+    ki: 0.5               # Integral     - triệt tiêu sai số xác lập
+    kd: 5.0               # Derivative   - giảm dao động
+
+    # --- Mục tiêu ---
+    target_pitch: 0.0     # Góc pitch mục tiêu (rad). 0 = đứng thẳng
+
+    # --- Giới hạn ---
+    max_velocity: 1.5     # Vận tốc tối đa (m/s)
+    integral_max: 10.0    # Giới hạn anti-windup cho tích phân
+
+    # --- Bộ lọc ---
+    derivative_filter_alpha: 0.1  # Hệ số lọc đạo hàm (0-1, nhỏ = lọc mạnh)
+
+    # --- Tùy chọn ---
+    use_gyro_derivative: true     # Dùng gyro cho đạo hàm (khuyến nghị)
+    fall_threshold: 0.785         # Ngưỡng ngã (~45°). Dừng motor khi vượt qua
+    enabled: true                 # Bật/tắt controller
+
+
+# =============================================
+# Cấu hình PID Auto-Tuner
+# =============================================
+
+pid_tuner:
+  ros__parameters:
+    # --- Relay Feedback ---
+    relay_amplitude: 0.3        # Biên độ relay (m/s). Lớn hơn = dao động mạnh hơn
+    stabilizing_kp: 30.0        # Kp ổn định cơ bản (giữ robot không ngã khi tune)
+    stabilizing_kd: 3.0         # Kd ổn định cơ bản
+
+    # --- Đo lường ---
+    num_cycles: 6               # Số chu kỳ dao động cần đo (nhiều hơn = chính xác hơn)
+
+    # --- Quy tắc Ziegler-Nichols ---
+    # Chọn 1 trong: 'classic', 'some_overshoot', 'no_overshoot', 'pessen'
+    #   classic:         Đáp ứng nhanh, vọt lố ~25%
+    #   some_overshoot:  Cân bằng tốc độ/ổn định, vọt lố ~15%
+    #   no_overshoot:    Ổn định nhất, đáp ứng chậm hơn
+    #   pessen:          Đáp ứng nhanh nhất, vọt lố cao
+    zn_rule: 'some_overshoot'
+
+    # --- Thời gian ---
+    stabilize_duration: 3.0     # Thời gian ổn định ban đầu (s)
+    verify: true                # Có kiểm nghiệm kết quả không
+    verify_duration: 8.0        # Thời gian kiểm nghiệm (s)
+
+    # --- An toàn ---
+    fall_threshold: 0.785       # Ngưỡng ngã (rad)
+    max_velocity: 1.5           # Vận tốc tối đa (m/s)
+
+    # --- Lưu kết quả ---
+    output_file: '~/tuned_pid_params.yaml'
