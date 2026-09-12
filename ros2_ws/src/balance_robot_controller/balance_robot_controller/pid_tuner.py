@@ -339,11 +339,19 @@ class PsoPIDTunerNode(Node):
     def _evaluate_and_next_particle(self, timestamp):
         """Chấm điểm theo thang điểm 100% chuẩn xác và tiến hóa bầy đàn."""
         particle = self.particles[self.current_particle_idx]
+        final_pitch_deg = math.degrees(abs(self.pitch_history[-1])) if self.pitch_history else 45.0
 
-        if self.robot_fell or len(self.pitch_history) < 10:
+        # Nếu đã ngã HOẶC khi hết giờ mà xe vẫn chưa hồi phục (vẫn nghiêng > 4.5° đang trên đà ngã) -> Cho 0 điểm!
+        if self.robot_fell or len(self.pitch_history) < 10 or final_pitch_deg > 4.5:
             fitness = 0.0
             rms_deg = 45.0
             over_deg = 45.0
+            if final_pitch_deg > 4.5 and not self.robot_fell:
+                bad_pos = list(particle.position)
+                self.blacklist.append(bad_pos)
+                self.get_logger().warn(
+                    f'    ⚠️ Hết giờ nhưng xe chưa hồi phục (Góc cuối = {final_pitch_deg:.1f}° > 4.5°)! Bị loại 🚫'
+                )
         else:
             rms_pitch = math.sqrt(sum(p**2 for p in self.pitch_history) / len(self.pitch_history))
             rms_deg = math.degrees(rms_pitch)
