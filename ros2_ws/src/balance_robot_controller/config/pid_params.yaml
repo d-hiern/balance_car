@@ -13,9 +13,9 @@
 balance_controller:
   ros__parameters:
     # --- Hệ số PID ---
-    kp: 50.0              # Proportional - phản ứng tỉ lệ với sai số
-    ki: 0.5               # Integral     - triệt tiêu sai số xác lập
-    kd: 5.0               # Derivative   - giảm dao động
+    kp: 4.524204         # Proportional - phản ứng tỉ lệ với sai số
+    ki:  73.365465              # Integral     - triệt tiêu sai số xác lập
+    kd: 0.184135              # Derivative   - giảm dao động
 
     # --- Mục tiêu ---
     target_pitch: 0.0     # Góc pitch mục tiêu (rad). 0 = đứng thẳng
