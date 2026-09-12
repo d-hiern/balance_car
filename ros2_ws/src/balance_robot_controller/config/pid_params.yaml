@@ -12,10 +12,10 @@
 
 balance_controller:
   ros__parameters:
-    # --- Hệ số PID ---
-    kp: 4.524204         # Proportional - phản ứng tỉ lệ với sai số
-    ki:  73.365465              # Integral     - triệt tiêu sai số xác lập
-    kd: 0.184135              # Derivative   - giảm dao động
+    # --- Hệ số PID chuẩn cho xe cân bằng hai bánh ---
+    kp: 52.0              # Proportional - phản ứng tỉ lệ với sai số
+    ki: 0.8               # Integral     - triệt tiêu sai số xác lập (nhỏ để chống trôi)
+    kd: 5.5               # Derivative   - giảm chấn, dập tắt dao động
 
     # --- Mục tiêu ---
     target_pitch: 0.0     # Góc pitch mục tiêu (rad). 0 = đứng thẳng

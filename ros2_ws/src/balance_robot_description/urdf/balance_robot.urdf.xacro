@@ -375,6 +375,10 @@
     <origin xyz="0.030 0.020 ${pcb_thickness/2 + 0.003}" rpy="0 0 0"/>
   </joint>
 
+  <gazebo reference="imu_joint">
+    <preserveFixedJoint>true</preserveFixedJoint>
+  </gazebo>
+
 
   <!-- ====== TRỤ ĐỠ TẦNG 2 (4 trụ từ PCB lên khung pin) ====== -->
   <xacro:property name="so2_x" value="${battery_length/2 - 0.005}"/>

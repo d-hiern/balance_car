@@ -25,6 +25,7 @@ Parameters (có thể thay đổi runtime bằng ros2 param set):
 import math
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Imu
 from geometry_msgs.msg import Twist
@@ -102,9 +103,9 @@ class BalanceControllerNode(Node):
         # ===== Callback cập nhật parameter runtime =====
         self.add_on_set_parameters_callback(self.parameter_callback)
 
-        # ===== Subscribers =====
+        # ===== Subscribers (Dùng qos_profile_sensor_data chống rớt gói) =====
         self.imu_sub = self.create_subscription(
-            Imu, 'imu/data', self.imu_callback, 10
+            Imu, 'imu/data', self.imu_callback, qos_profile_sensor_data
         )
 
         # ===== Publishers =====
@@ -205,6 +206,7 @@ class BalanceControllerNode(Node):
                 )
                 self.publish_status('FALLEN')
             self.publish_cmd_vel(0.0)
+            self.publish_diagnostics(pitch, pitch - self.target_pitch, 0.0)
             return
         else:
             if self.fallen:
