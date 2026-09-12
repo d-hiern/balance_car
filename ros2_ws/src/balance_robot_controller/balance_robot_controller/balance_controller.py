@@ -29,7 +29,7 @@ from rclpy.qos import qos_profile_sensor_data
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Imu
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Float64MultiArray, MultiArrayDimension, String
+from std_msgs.msg import Float64, Float64MultiArray, MultiArrayDimension, String
 
 from balance_robot_controller.pid import PIDController
 
@@ -114,6 +114,14 @@ class BalanceControllerNode(Node):
             Float64MultiArray, 'balance/diagnostics', 10
         )
         self.status_pub = self.create_publisher(String, 'balance/status', 10)
+
+        # Các topic Float64 riêng biệt cho rqt_plot
+        self.pitch_pub = self.create_publisher(Float64, 'balance/pitch', 10)
+        self.error_pub = self.create_publisher(Float64, 'balance/error', 10)
+        self.p_pub = self.create_publisher(Float64, 'balance/p_term', 10)
+        self.i_pub = self.create_publisher(Float64, 'balance/i_term', 10)
+        self.d_pub = self.create_publisher(Float64, 'balance/d_term', 10)
+        self.output_pub = self.create_publisher(Float64, 'balance/output', 10)
 
         # ===== Log thông tin khởi động =====
         self.get_logger().info('=' * 50)
@@ -270,6 +278,31 @@ class BalanceControllerNode(Node):
             self.pid.integral,
         ]
         self.diag_pub.publish(msg)
+
+        # Publish các topic Float64 đơn lẻ để rqt_plot nhận diện ngay lập tức
+        f_pitch = Float64()
+        f_pitch.data = float(pitch)
+        self.pitch_pub.publish(f_pitch)
+
+        f_error = Float64()
+        f_error.data = float(error)
+        self.error_pub.publish(f_error)
+
+        f_p = Float64()
+        f_p.data = float(self.pid.last_p_term)
+        self.p_pub.publish(f_p)
+
+        f_i = Float64()
+        f_i.data = float(self.pid.last_i_term)
+        self.i_pub.publish(f_i)
+
+        f_d = Float64()
+        f_d.data = float(self.pid.last_d_term)
+        self.d_pub.publish(f_d)
+
+        f_out = Float64()
+        f_out.data = float(output)
+        self.output_pub.publish(f_out)
 
     def publish_status(self, status):
         """Publish trạng thái controller lên /balance/status."""
