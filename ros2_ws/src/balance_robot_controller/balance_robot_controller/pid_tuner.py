@@ -70,17 +70,17 @@ class PIDTunerNode(Node):
         super().__init__('pid_tuner')
 
         # ===== Parameters =====
-        self.declare_parameter('relay_amplitude', 0.3)
-        self.declare_parameter('stabilizing_kp', 35.0)
-        self.declare_parameter('stabilizing_kd', 4.0)
-        self.declare_parameter('num_cycles', 5)
+        self.declare_parameter('relay_amplitude', 0.15)      # Biên độ relay nhẹ nhàng (m/s)
+        self.declare_parameter('stabilizing_kp', 48.0)       # Kp cơ sở đủ mạnh giữ xe đứng
+        self.declare_parameter('stabilizing_kd', 5.0)        # Kd cơ sở giảm chấn
+        self.declare_parameter('num_cycles', 3)              # 3 chu kỳ là đủ chính xác và nhanh
         self.declare_parameter('zn_rule', 'balance_optimized')
-        self.declare_parameter('stabilize_duration', 2.5)
+        self.declare_parameter('stabilize_duration', 1.5)
         self.declare_parameter('verify', True)
-        self.declare_parameter('verify_duration', 6.0)
+        self.declare_parameter('verify_duration', 5.0)
         self.declare_parameter('fall_threshold', 0.785)
         self.declare_parameter('max_velocity', 1.5)
-        self.declare_parameter('max_iterations', 3)  # Mặc định tối ưu qua 3 lần lấy mẫu
+        self.declare_parameter('max_iterations', 3)          # 3 lần lấy mẫu tối ưu
         self.declare_parameter('output_file', '~/tuned_pid_params.yaml')
 
         # Lấy giá trị
@@ -214,7 +214,7 @@ class PIDTunerNode(Node):
             self._enter_reset(timestamp)
 
         elif self.phase == self.PHASE_RESET:
-            self._do_reset(timestamp)
+            self._do_reset(pitch, gyro_y, timestamp)
 
         elif self.phase == self.PHASE_STABILIZE:
             self._do_stabilize(pitch, gyro_y, timestamp)
@@ -239,14 +239,15 @@ class PIDTunerNode(Node):
         """Chuyển sang phase RESET và gọi Gazebo reset."""
         self.phase = self.PHASE_RESET
         self.phase_start_time = timestamp
-        self.publish_cmd_vel(0.0)
         self.trigger_gazebo_reset()
         self.publish_status(f'RESETTING (Lần {self.current_iteration}/{self.max_iterations})')
 
-    def _do_reset(self, timestamp):
-        """Chờ 1.5 giây cho thế giới Gazebo ổn định lại."""
-        self.publish_cmd_vel(0.0)
-        if timestamp - self.phase_start_time > 1.5:
+    def _do_reset(self, pitch, gyro_y, timestamp):
+        """Giữ robot thăng bằng ngay lập tức trong khi Gazebo ổn định thế giới."""
+        error = pitch - 0.0
+        output = self.stab_kp * error + self.stab_kd * gyro_y
+        self.publish_cmd_vel(output)
+        if timestamp - self.phase_start_time > 0.8:
             self._enter_stabilize(timestamp)
 
     # ================================================================

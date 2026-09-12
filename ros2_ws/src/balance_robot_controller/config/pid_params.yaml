@@ -40,12 +40,12 @@ balance_controller:
 pid_tuner:
   ros__parameters:
     # --- Relay Feedback ---
-    relay_amplitude: 0.3        # Biên độ relay (m/s)
-    stabilizing_kp: 35.0        # Kp ổn định cơ bản
-    stabilizing_kd: 4.0         # Kd ổn định cơ bản
+    relay_amplitude: 0.15       # Biên độ relay nhẹ nhàng (m/s)
+    stabilizing_kp: 48.0        # Kp ổn định cơ bản đủ mạnh giữ xe đứng
+    stabilizing_kd: 5.0         # Kd ổn định cơ bản
 
     # --- Đo lường ---
-    num_cycles: 5               # Số chu kỳ dao động cần đo
+    num_cycles: 3               # 3 chu kỳ là đủ nhanh và chuẩn xác
     max_iterations: 3           # Tự động reset và lấy mẫu 3 lần để chọn bộ tối ưu
 
     # --- Quy tắc tối ưu cho xe cân bằng ---
