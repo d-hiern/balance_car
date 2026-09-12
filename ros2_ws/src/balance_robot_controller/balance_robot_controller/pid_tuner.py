@@ -277,14 +277,22 @@ class PsoPIDTunerNode(Node):
                 self.get_logger().info('    👉 [Lực đẩy]: Tác dụng lực xô thử nghiệm vào xe...')
 
         # ============================================================
-        # 3. STATE: DISTURBANCE (Xung lực 0.12s)
+        # 3. STATE: DISTURBANCE (Xung lực huých nhẹ trên nền PID đang giữ)
         # ============================================================
         elif self.state == self.STATE_DISTURBANCE:
-            self.publish_cmd_vel(0.30)
-            if elapsed > 0.12:
+            error = pitch - self.current_target_pitch
+            pid_out = self.current_pid.compute(error, timestamp, measured_rate=gyro_y)
+            # Thêm lực huých (xung đẩy) vào output để thử phản xạ
+            output = pid_out + 0.18
+            self.publish_cmd_vel(output)
+
+            self.pitch_history.append(pitch)
+            self.output_history.append(output)
+            self.max_recovery_pitch = max(self.max_recovery_pitch, abs(pitch))
+
+            if elapsed > 0.10:
                 self.state = self.STATE_RECOVERY
                 self.state_start_time = timestamp
-                self.max_recovery_pitch = 0.0
 
         # ============================================================
         # 4. STATE: RECOVERY (Đo phản xạ kéo lại thăng bằng 2.5s)
@@ -343,8 +351,8 @@ class PsoPIDTunerNode(Node):
             avg_drift = abs(sum(self.output_history) / len(self.output_history))
 
             # THANG ĐIỂM HÀM MŨ CHUẨN 0 - 100%
-            # Đứng vững (RMS < 1°), kháng lực tốt (vọt lố < 3°), không trôi => Điểm 85 ~ 98/100
-            penalty = (0.12 * rms_deg) + (0.04 * over_deg) + (1.2 * avg_drift)
+            # Đứng vững (RMS < 1.5°), kháng lực tốt (vọt lố < 5°), ít trôi => Điểm 80 ~ 95/100
+            penalty = (0.05 * rms_deg) + (0.02 * over_deg) + (0.35 * avg_drift)
             fitness = 100.0 * math.exp(-penalty)
 
         particle.current_fitness = fitness
