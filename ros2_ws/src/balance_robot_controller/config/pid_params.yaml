@@ -39,26 +39,12 @@ balance_controller:
 
 pid_tuner:
   ros__parameters:
-    # --- Relay Feedback ---
-    relay_amplitude: 0.15       # Biên độ relay nhẹ nhàng (m/s)
-    stabilizing_kp: 55.0        # Kp ổn định cơ bản chuẩn giữ vững robot
-    stabilizing_kd: 6.0         # Kd ổn định cơ bản chuẩn giảm chấn
+    # --- Cấu hình Thuật toán Tối ưu Bầy đàn (PSO AI) ---
+    num_particles: 4            # Số lượng cá thể trong bầy (mỗi cá thể mang 1 bộ PID)
+    max_generations: 3          # Số thế hệ tiến hóa và hội tụ bầy đàn
 
-    # --- Đo lường ---
-    num_cycles: 3               # 3 chu kỳ là đủ nhanh và chuẩn xác
-    max_iterations: 3           # Tự động reset và lấy mẫu 3 lần để chọn bộ tối ưu
-
-    # --- Quy tắc tối ưu cho xe cân bằng ---
-    # Chọn: 'balance_optimized' (khuyên dùng), 'balance_stiff', 'balance_smooth'
-    zn_rule: 'balance_optimized'
-
-    # --- Thời gian ---
-    stabilize_duration: 2.5     # Thời gian ổn định ban đầu (s)
-    verify: true                # Có kiểm nghiệm kết quả không
-    verify_duration: 6.0        # Thời gian kiểm nghiệm mỗi vòng (s)
-
-    # --- An toàn ---
-    fall_threshold: 0.785       # Ngưỡng ngã (rad)
+    # --- An toàn & Giới hạn ---
+    fall_threshold: 0.785       # Ngưỡng ngã (rad, ~45 độ)
     max_velocity: 1.5           # Vận tốc tối đa (m/s)
 
     # --- Lưu kết quả ---

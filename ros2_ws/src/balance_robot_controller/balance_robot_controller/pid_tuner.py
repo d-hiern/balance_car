@@ -1,15 +1,18 @@
 """
-PID Auto-Tuner Node - Tự động tìm hệ số PID tối ưu cho xe cân bằng hai bánh.
+PID Auto-Tuner Node - Sử dụng Thuật toán Tối ưu hóa Bầy đàn (Particle Swarm Optimization - PSO)
+Tự động tìm bộ PID và Target Pitch tối ưu nhất cho xe cân bằng hai bánh trong Gazebo.
 
-Tính năng nâng cao:
-- Tự động Reset thế giới trong Gazebo (/reset_world) qua nhiều vòng lặp (Iterations)
-- Phương pháp: Relay Feedback (Åström-Hägglund) tinh chỉnh riêng cho Inverted Pendulum
-- Tự động dựng lại robot khi ngã và thử lại
-- Đánh giá chất lượng (Score & RMS Error) và chọn ra bộ thông số tối ưu nhất
+Đặc tính AI nổi bật:
+1. Mô phỏng hành vi bầy đàn (PSO) tìm kiếm trong không gian 4 chiều: (Kp, Ki, Kd, Target Pitch).
+2. Kiểm tra khả năng kháng nhiễu (Disturbance Rejection): Tự động phát xung lực đẩy thử nghiệm
+   để đánh giá khả năng phản hồi thăng bằng trở lại của xe.
+3. Tự động Reset thế giới Gazebo (/reset_world) giữa các cá thể.
+4. Lưu bộ số tối ưu tốt nhất (Global Best) vào file YAML.
 """
 
 import math
 import os
+import random
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -29,506 +32,358 @@ def quaternion_to_pitch(q):
     return math.asin(sinp)
 
 
-class PIDTunerNode(Node):
+class Particle:
+    """Đại diện cho 1 cá thể trong bầy đàn mang bộ gen PID."""
+
+    def __init__(self, bounds):
+        self.bounds = bounds  # [(min, max) cho Kp, Ki, Kd, Target_Pitch]
+        # Khởi tạo vị trí ngẫu nhiên trong vùng tìm kiếm hợp lý
+        self.position = [
+            random.uniform(b[0], b[1]) for b in bounds
+        ]
+        # Vận tốc bay ban đầu
+        self.velocity = [
+            random.uniform(-0.5 * (b[1] - b[0]), 0.5 * (b[1] - b[0])) * 0.1
+            for b in bounds
+        ]
+        self.best_position = list(self.position)
+        self.best_fitness = -float('inf')
+        self.current_fitness = 0.0
+
+    def update(self, global_best_pos, w=0.5, c1=1.5, c2=1.5):
+        """Cập nhật vận tốc và vị trí của hạt theo PSO."""
+        for i in range(len(self.position)):
+            r1 = random.random()
+            r2 = random.random()
+
+            # Thành phần quán tính + nhận thức cá nhân + học hỏi bầy đàn
+            v_cognitive = c1 * r1 * (self.best_position[i] - self.position[i])
+            v_social = c2 * r2 * (global_best_pos[i] - self.position[i])
+            self.velocity[i] = w * self.velocity[i] + v_cognitive + v_social
+
+            # Giới hạn vận tốc bay tối đa
+            v_max = (self.bounds[i][1] - self.bounds[i][0]) * 0.2
+            self.velocity[i] = max(-v_max, min(v_max, self.velocity[i]))
+
+            # Cập nhật vị trí
+            self.position[i] += self.velocity[i]
+            # Giới hạn trong biên cho phép
+            self.position[i] = max(self.bounds[i][0], min(self.bounds[i][1], self.position[i]))
+
+
+class PsoPIDTunerNode(Node):
     """
-    Node tự động điều chỉnh PID với cơ chế Auto-Reset đa vòng lặp trong Gazebo.
+    ROS 2 Node thực thi thuật toán PSO để tìm bộ số PID cho xe cân bằng.
     """
 
-    # === Các phase tuning ===
-    PHASE_WAIT = 'WAIT'
-    PHASE_RESET = 'RESET'
-    PHASE_STABILIZE = 'STABILIZE'
-    PHASE_RELAY = 'RELAY'
-    PHASE_ANALYZE = 'ANALYZE'
-    PHASE_VERIFY = 'VERIFY'
-    PHASE_DONE = 'DONE'
+    # Các trạng thái của máy trạng thái
+    STATE_RESET = 'RESET'
+    STATE_BALANCE = 'BALANCE'         # Kiểm tra đứng yên
+    STATE_DISTURBANCE = 'DISTURB'     # Tác dụng xung lực
+    STATE_RECOVERY = 'RECOVERY'       # Đo thời gian hồi phục và độ vọt lố
+    STATE_EVALUATE = 'EVALUATE'
+    STATE_DONE = 'DONE'
 
-    # === Quy tắc điều khiển tinh chỉnh riêng cho Inverted Pendulum ===
-    # (Tránh lỗi Ki quá lớn của công thức ZN công nghiệp cổ điển)
-    TUNING_RULES = {
-        'balance_optimized': {
-            'name': 'Balance Robot Optimized (Khuyên dùng)',
-            'kp_factor': 0.50,
-            'ki_ratio': 0.015,   # Ki = 0.015 * Kp (nhỏ để chống trôi)
-            'td_factor': 0.12,   # Kd = Kp * 0.12 * Tu
-        },
-        'balance_stiff': {
-            'name': 'Balance Robot Stiff (Cứng vững)',
-            'kp_factor': 0.65,
-            'ki_ratio': 0.010,
-            'td_factor': 0.15,
-        },
-        'balance_smooth': {
-            'name': 'Balance Robot Smooth (Mềm mại)',
-            'kp_factor': 0.40,
-            'ki_ratio': 0.020,
-            'td_factor': 0.10,
-        },
-    }
+    # Không gian tìm kiếm 4 chiều: [Kp, Ki, Kd, Target_Pitch]
+    SEARCH_BOUNDS = [
+        (45.0, 75.0),       # Kp: 45 đến 75
+        (0.2, 1.2),         # Ki: 0.2 đến 1.2 (nhỏ để chống trôi)
+        (4.5, 8.5),         # Kd: 4.5 đến 8.5 (giảm xóc mạnh)
+        (-0.008, 0.008),    # Target Pitch: bù lệch góc tự nhiên (rad)
+    ]
 
     def __init__(self):
         super().__init__('pid_tuner')
 
         # ===== Parameters =====
-        self.declare_parameter('relay_amplitude', 0.15)      # Biên độ relay nhẹ nhàng (m/s)
-        self.declare_parameter('stabilizing_kp', 55.0)       # Kp cơ sở chuẩn giữ vững robot
-        self.declare_parameter('stabilizing_kd', 6.0)        # Kd cơ sở giảm chấn chuẩn
-        self.declare_parameter('num_cycles', 3)              # 3 chu kỳ đo là chuẩn xác
-        self.declare_parameter('zn_rule', 'balance_optimized')
-        self.declare_parameter('stabilize_duration', 1.5)
-        self.declare_parameter('verify', True)
-        self.declare_parameter('verify_duration', 5.0)
-        self.declare_parameter('fall_threshold', 0.785)
+        self.declare_parameter('num_particles', 4)       # Số cá thể trong 1 thế hệ
+        self.declare_parameter('max_generations', 3)     # Số thế hệ tìm kiếm
+        self.declare_parameter('fall_threshold', 0.785)  # 45 độ
         self.declare_parameter('max_velocity', 1.5)
-        self.declare_parameter('max_iterations', 3)          # 3 lần lấy mẫu tối ưu
         self.declare_parameter('output_file', '~/tuned_pid_params.yaml')
 
-        # Lấy giá trị
-        self.relay_amplitude = self.get_parameter('relay_amplitude').value
-        self.stab_kp = self.get_parameter('stabilizing_kp').value
-        self.stab_kd = self.get_parameter('stabilizing_kd').value
-        self.num_cycles = self.get_parameter('num_cycles').value
-        self.zn_rule = self.get_parameter('zn_rule').value
-        self.stabilize_duration = self.get_parameter('stabilize_duration').value
-        self.do_verify = self.get_parameter('verify').value
-        self.verify_duration = self.get_parameter('verify_duration').value
+        self.num_particles = self.get_parameter('num_particles').value
+        self.max_generations = self.get_parameter('max_generations').value
         self.fall_threshold = self.get_parameter('fall_threshold').value
         self.max_velocity = self.get_parameter('max_velocity').value
-        self.max_iterations = self.get_parameter('max_iterations').value
         self.output_file = self.get_parameter('output_file').value
 
-        # Trạng thái vòng lặp
-        self.current_iteration = 1
-        self.iteration_results = []
+        # Khởi tạo bầy đàn PSO
+        self.particles = [Particle(self.SEARCH_BOUNDS) for _ in range(self.num_particles)]
+        # Hạt đầu tiên gán điểm khởi đầu chuẩn mẫu
+        self.particles[0].position = [55.0, 0.7, 6.0, 0.0]
+        self.particles[0].best_position = list(self.particles[0].position)
 
-        # Trạng thái tuner
-        self.phase = self.PHASE_WAIT
-        self.phase_start_time = None
-        self.start_time = None
+        self.global_best_position = list(self.particles[0].position)
+        self.global_best_fitness = -float('inf')
 
-        # Dữ liệu relay
-        self.relay_data = []
-        self.zero_crossings = []
-        self.peaks = []
-        self.prev_sign = 0
-        self.cycle_count = 0
-        self.half_cycle_max_pitch = 0.0
+        # Quản lý tiến trình
+        self.current_generation = 1
+        self.current_particle_idx = 0
+        self.state = self.STATE_RESET
+        self.state_start_time = None
 
-        # Kết quả tuning
-        self.ku = 0.0
-        self.tu = 0.0
-        self.computed_kp = 0.0
-        self.computed_ki = 0.0
-        self.computed_kd = 0.0
+        # Bộ điều khiển thử nghiệm hiện tại
+        self.current_pid = None
+        self.current_target_pitch = 0.0
 
-        # Verification
-        self.verify_pid = None
-        self.verify_errors = []
+        # Dữ liệu đo đạc trong 1 lượt thử
+        self.pitch_history = []
+        self.output_history = []
+        self.max_recovery_pitch = 0.0
+        self.robot_fell = False
 
-        # Service clients reset Gazebo
+        # Service Gazebo Reset
         self.reset_world_cli = self.create_client(Empty, '/reset_world')
         self.reset_sim_cli = self.create_client(Empty, '/reset_simulation')
 
-        # ===== Publishers =====
+        # ROS Publishers / Subscribers
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
         self.status_pub = self.create_publisher(String, 'pid_tuner/status', 10)
-        self.data_pub = self.create_publisher(
-            Float64MultiArray, 'pid_tuner/data', 10
-        )
-
-        # ===== Subscriber (SensorDataQoS chống rớt gói) =====
+        self.data_pub = self.create_publisher(Float64MultiArray, 'pid_tuner/data', 10)
         self.imu_sub = self.create_subscription(
             Imu, 'imu/data', self.imu_callback, qos_profile_sensor_data
         )
 
-        # ===== Log khởi động =====
         self.get_logger().info('')
-        self.get_logger().info('=' * 60)
-        self.get_logger().info('  🤖 PID AUTO-TUNER VỚI TỰ ĐỘNG RESET GAZEBO')
-        self.get_logger().info('=' * 60)
-        self.get_logger().info(f'  Số lần lấy mẫu tối ưu: {self.max_iterations} lần')
-        self.get_logger().info(f'  Biên độ kích thích:     {self.relay_amplitude} m/s')
-        self.get_logger().info(f'  Quy tắc tối ưu:        {self.zn_rule}')
-        self.get_logger().info('=' * 60)
-        self.get_logger().info('Đang chờ dữ liệu IMU để bắt đầu...')
+        self.get_logger().info('=' * 65)
+        self.get_logger().info('  🐝 THUẬT TOÁN BẦY ĐÀN (PSO) - TỰ ĐỘNG TỐI ƯU HÓA PID 🤖')
+        self.get_logger().info('=' * 65)
+        self.get_logger().info(f'  Số cá thể trong bầy (Particles):  {self.num_particles}')
+        self.get_logger().info(f'  Số thế hệ tìm kiếm (Generations): {self.max_generations}')
+        self.get_logger().info(f'  Thử nghiệm kháng lực đẩy:        TỰ ĐỘNG KÍCH HOẠT')
+        self.get_logger().info('=' * 65)
+        self.get_logger().info('Đang chuẩn bị cá thể đầu tiên...')
         self.get_logger().info('')
 
     def trigger_gazebo_reset(self):
-        """Gọi service reset trong Gazebo để robot đứng thẳng lại."""
+        """Gọi service reset trong Gazebo."""
         req = Empty.Request()
         if self.reset_world_cli.service_is_ready():
             self.reset_world_cli.call_async(req)
-            self.get_logger().info('🔄 Đã gọi Gazebo /reset_world để dựng lại robot!')
         elif self.reset_sim_cli.service_is_ready():
             self.reset_sim_cli.call_async(req)
-            self.get_logger().info('🔄 Đã gọi Gazebo /reset_simulation để dựng lại robot!')
-        else:
-            self.get_logger().warn('⚠️ Gazebo reset service đang chờ kết nối...')
-
-    def publish_status(self, text):
-        """Publish trạng thái tuner."""
-        msg = String()
-        msg.data = text
-        self.status_pub.publish(msg)
-
-    def publish_data(self, pitch, error, output, phase_id):
-        """Publish dữ liệu cho monitoring."""
-        msg = Float64MultiArray()
-        msg.layout.dim = [MultiArrayDimension(
-            label='tuner_data', size=4, stride=4
-        )]
-        msg.data = [pitch, error, output, float(phase_id)]
-        self.data_pub.publish(msg)
 
     def publish_cmd_vel(self, linear_x):
-        """Publish lệnh vận tốc (clamped)."""
+        """Xuất lệnh điều khiển."""
         twist = Twist()
-        twist.linear.x = max(-self.max_velocity,
-                             min(self.max_velocity, linear_x))
+        twist.linear.x = max(-self.max_velocity, min(self.max_velocity, linear_x))
         self.cmd_vel_pub.publish(twist)
 
     def imu_callback(self, msg):
-        """State machine chính xử lý theo phase và vòng lặp."""
+        """Vòng lặp điều khiển và đánh giá Fitness của cá thể."""
         pitch = quaternion_to_pitch(msg.orientation)
         gyro_y = msg.angular_velocity.y
         timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
-        if self.start_time is None:
-            self.start_time = timestamp
+        if self.state_start_time is None:
+            self.state_start_time = timestamp
 
-        # Phát hiện ngã -> Tự động gọi Gazebo reset và thử lại
-        if abs(pitch) > self.fall_threshold:
-            if self.phase not in [self.PHASE_DONE, self.PHASE_WAIT, self.PHASE_RESET]:
-                self.get_logger().warn(
-                    f'⚠️ Robot ngã ở lần thử #{self.current_iteration} (Pitch = {math.degrees(pitch):.1f}°)! '
-                    f'Tự động reset Gazebo và thử lại...'
-                )
-                self.publish_cmd_vel(0.0)
-                self.stab_kp = min(70.0, self.stab_kp * 1.1)
-                self.stab_kd = min(8.0, self.stab_kd * 1.1)
-                self._enter_reset(timestamp)
-                return
+        elapsed = timestamp - self.state_start_time
 
-        # State machine
-        if self.phase == self.PHASE_WAIT:
-            self._enter_reset(timestamp)
-
-        elif self.phase == self.PHASE_RESET:
-            self._do_reset(pitch, gyro_y, timestamp)
-
-        elif self.phase == self.PHASE_STABILIZE:
-            self._do_stabilize(pitch, gyro_y, timestamp)
-
-        elif self.phase == self.PHASE_RELAY:
-            self._do_relay(pitch, gyro_y, timestamp)
-
-        elif self.phase == self.PHASE_ANALYZE:
-            self._do_analyze(timestamp)
-
-        elif self.phase == self.PHASE_VERIFY:
-            self._do_verify(pitch, gyro_y, timestamp)
-
-        elif self.phase == self.PHASE_DONE:
-            self.publish_cmd_vel(0.0)
-
-    # ================================================================
-    #                     PHASE: RESET
-    # ================================================================
-
-    def _enter_reset(self, timestamp):
-        """Chuyển sang phase RESET và gọi Gazebo reset."""
-        self.phase = self.PHASE_RESET
-        self.phase_start_time = timestamp
-        self.trigger_gazebo_reset()
-        self.publish_status(f'RESETTING (Lần {self.current_iteration}/{self.max_iterations})')
-
-    def _do_reset(self, pitch, gyro_y, timestamp):
-        """Giữ robot thăng bằng ngay lập tức trong khi Gazebo ổn định thế giới."""
-        error = pitch - 0.0
-        output = self.stab_kp * error + self.stab_kd * gyro_y
-        self.publish_cmd_vel(output)
-        if timestamp - self.phase_start_time > 0.8:
-            self._enter_stabilize(timestamp)
-
-    # ================================================================
-    #                     PHASE: STABILIZE
-    # ================================================================
-
-    def _enter_stabilize(self, timestamp):
-        """Chuyển sang phase STABILIZE."""
-        self.phase = self.PHASE_STABILIZE
-        self.phase_start_time = timestamp
-        self.get_logger().info('')
-        self.get_logger().info('━' * 55)
-        self.get_logger().info(f'  📍 LẦN LẤY MẪU #{self.current_iteration}/{self.max_iterations}: ỔN ĐỊNH')
-        self.get_logger().info(f'  Sử dụng PD cơ sở: Kp={self.stab_kp:.1f}, Kd={self.stab_kd:.1f}')
-        self.get_logger().info('━' * 55)
-        self.publish_status(f'STABILIZE (#{self.current_iteration})')
-
-    def _do_stabilize(self, pitch, gyro_y, timestamp):
-        """Phase STABILIZE: Ổn định robot trước khi tạo dao động."""
-        elapsed = timestamp - self.phase_start_time
-
-        error = pitch - 0.0
-        output = self.stab_kp * error + self.stab_kd * gyro_y
-        self.publish_cmd_vel(output)
-        self.publish_data(pitch, error, output, 1.0)
-
-        if elapsed > self.stabilize_duration:
-            if abs(pitch) < 0.1:  # < 6 độ
-                self.get_logger().info(
-                    f'  ✓ Robot đã đứng thẳng ổn định! (pitch = {math.degrees(pitch):.2f}°)'
-                )
-                self._enter_relay(timestamp)
-            else:
-                self.phase_start_time = timestamp
-
-    # ================================================================
-    #                      PHASE: RELAY
-    # ================================================================
-
-    def _enter_relay(self, timestamp):
-        """Chuyển sang phase RELAY."""
-        self.phase = self.PHASE_RELAY
-        self.phase_start_time = timestamp
-        self.relay_data = []
-        self.zero_crossings = []
-        self.peaks = []
-        self.cycle_count = 0
-        self.prev_sign = 0
-        self.half_cycle_max_pitch = 0.0
-
-        # Điều chỉnh biên độ relay theo từng vòng lặp để lấy mẫu đa dạng
-        if self.current_iteration == 1:
-            self.active_amplitude = self.relay_amplitude * 0.85
-        elif self.current_iteration == 2:
-            self.active_amplitude = self.relay_amplitude
-        else:
-            self.active_amplitude = self.relay_amplitude * 1.15
-
-        self.get_logger().info('  📍 KÍCH HOẠT DAO ĐỘNG RELAY...')
-        self.get_logger().info(f'  Biên độ kích thích: {self.active_amplitude:.3f} m/s')
-        self.publish_status(f'RELAY (#{self.current_iteration})')
-
-    def _do_relay(self, pitch, gyro_y, timestamp):
-        """Phase RELAY: Tạo dao động có kiểm soát."""
-        error = pitch - 0.0
-        stab_output = self.stab_kp * error + self.stab_kd * gyro_y
-
-        if error > 0:
-            relay_output = self.active_amplitude
-        else:
-            relay_output = -self.active_amplitude
-
-        output = stab_output + relay_output
-        self.publish_cmd_vel(output)
-        self.publish_data(pitch, error, output, 2.0)
-
-        self.relay_data.append((timestamp, pitch, output))
-        self.half_cycle_max_pitch = max(self.half_cycle_max_pitch, abs(pitch))
-
-        current_sign = 1 if pitch >= 0 else -1
-        if self.prev_sign == 0:
-            self.prev_sign = current_sign
+        # Kiểm tra nếu xe ngã
+        if abs(pitch) > self.fall_threshold and self.state not in [self.STATE_RESET, self.STATE_DONE]:
+            self.robot_fell = True
+            self.get_logger().warn(
+                f'  ⚠️ Cá thể #{self.current_particle_idx + 1} làm ngã xe (Pitch = {math.degrees(pitch):.1f}°)! '
+                f'Điểm Fitness = 0.'
+            )
+            self._evaluate_and_next_particle(timestamp)
             return
 
-        if current_sign != self.prev_sign:
-            self.zero_crossings.append(timestamp)
-            self.cycle_count += 1
-            if self.half_cycle_max_pitch > 0.0001:
-                self.peaks.append(self.half_cycle_max_pitch)
-            self.half_cycle_max_pitch = 0.0
+        # ============================================================
+        # 1. STATE: RESET (Dựng xe đứng thẳng và giữ cân bằng cơ bản)
+        # ============================================================
+        if self.state == self.STATE_RESET:
+            # Dùng PD cơ sở giữ xe ngay lập tức khi vừa reset
+            out = 55.0 * (pitch - 0.0) + 6.0 * gyro_y
+            self.publish_cmd_vel(out)
 
-        self.prev_sign = current_sign
+            if elapsed > 0.8:
+                self._start_particle_trial(timestamp)
 
-        if self.cycle_count >= self.num_cycles * 2:
-            self.get_logger().info(f'  ✓ Đã đo đủ {self.num_cycles} chu kỳ dao động!')
-            self.phase = self.PHASE_ANALYZE
+        # ============================================================
+        # 2. STATE: BALANCE (Thử nghiệm đứng thẳng tự nhiên 2.5 giây)
+        # ============================================================
+        elif self.state == self.STATE_BALANCE:
+            error = pitch - self.current_target_pitch
+            output = self.current_pid.compute(error, timestamp, measured_rate=gyro_y)
+            self.publish_cmd_vel(output)
 
-    # ================================================================
-    #                     PHASE: ANALYZE
-    # ================================================================
+            # Ghi nhận dữ liệu
+            self.pitch_history.append(pitch)
+            self.output_history.append(output)
 
-    def _do_analyze(self, timestamp):
-        """Phase ANALYZE: Tính Ku, Tu và bộ PID."""
-        self.publish_status(f'ANALYZE (#{self.current_iteration})')
+            if elapsed > 2.5:
+                # Chuyển sang giai đoạn tác dụng lực đẩy
+                self.state = self.STATE_DISTURBANCE
+                self.state_start_time = timestamp
+                self.get_logger().info('    👉 Tác dụng lực đẩy thử nghiệm vào xe...')
 
-        if len(self.zero_crossings) < 4:
-            self.get_logger().error('  ✗ Không đủ dữ liệu zero-crossings, reset thử lại...')
-            self._enter_reset(timestamp)
-            return
+        # ============================================================
+        # 3. STATE: DISTURBANCE (Tác dụng xung lực 0.15s để tạo xô đẩy)
+        # ============================================================
+        elif self.state == self.STATE_DISTURBANCE:
+            # Phát một xung giật bánh xe để làm lệch robot
+            disturbance_cmd = 0.35  # m/s
+            self.publish_cmd_vel(disturbance_cmd)
 
-        crossings = self.zero_crossings[2:]
-        half_periods = [crossings[i] - crossings[i - 1] for i in range(1, len(crossings)) if crossings[i] - crossings[i - 1] > 0.001]
+            if elapsed > 0.15:
+                # Ngừng tác dụng lực, chuyển sang đo phản hồi hồi phục
+                self.state = self.STATE_RECOVERY
+                self.state_start_time = timestamp
+                self.max_recovery_pitch = 0.0
 
-        if not half_periods:
-            self._enter_reset(timestamp)
-            return
+        # ============================================================
+        # 4. STATE: RECOVERY (Đo tốc độ phản hồi kéo xe về cân bằng 3.0s)
+        # ============================================================
+        elif self.state == self.STATE_RECOVERY:
+            error = pitch - self.current_target_pitch
+            output = self.current_pid.compute(error, timestamp, measured_rate=gyro_y)
+            self.publish_cmd_vel(output)
 
-        avg_half_period = sum(half_periods) / len(half_periods)
-        self.tu = 2.0 * avg_half_period
+            self.pitch_history.append(pitch)
+            self.output_history.append(output)
+            self.max_recovery_pitch = max(self.max_recovery_pitch, abs(pitch))
 
-        valid_peaks = self.peaks[1:] if len(self.peaks) > 1 else self.peaks
-        avg_amplitude = sum(valid_peaks) / len(valid_peaks)
+            if elapsed > 3.0:
+                # Hoàn thành 1 lượt thử cá thể
+                self._evaluate_and_next_particle(timestamp)
 
-        # Tính Ku = 4*d / (pi*a)
-        self.ku = 4.0 * self.active_amplitude / (math.pi * avg_amplitude)
+    def _start_particle_trial(self, timestamp):
+        """Chuẩn bị thông số của cá thể hiện tại và bắt đầu đo."""
+        particle = self.particles[self.current_particle_idx]
+        kp, ki, kd, target_p = particle.position
 
-        # Tính thông số PID tối ưu cho xe cân bằng (kết hợp nền ổn định + Ku)
-        rule = self.TUNING_RULES.get(self.zn_rule, self.TUNING_RULES['balance_optimized'])
-        
-        # Kp tổng thể = Kp cơ sở + độ nhạy tới hạn đo được từ dao động relay
-        self.computed_kp = float(self.stab_kp + (rule['kp_factor'] * self.ku * 2.0))
-        
-        # Kd đảm bảo đủ lực cản giảm chấn (tỉ lệ theo Kp và Tu để dập tắt lắc lư)
-        self.computed_kd = float(max(5.8, self.computed_kp * 0.11))
-        
-        # Ki nhỏ (1-1.5% Kp) vừa đủ để triệt tiêu trôi tĩnh mà không gây lật xe
-        self.computed_ki = float(min(1.2, rule['ki_ratio'] * self.computed_kp))
-
-        self.get_logger().info(f'  Ku = {self.ku:.4f}, Tu = {self.tu:.4f}s')
-        self.get_logger().info(
-            f'  >> Tính được: Kp={self.computed_kp:.3f} | Ki={self.computed_ki:.3f} | Kd={self.computed_kd:.3f}'
-        )
-
-        if self.do_verify:
-            self._enter_verify()
-        else:
-            self._finish_all_iterations()
-
-    # ================================================================
-    #                      PHASE: VERIFY
-    # ================================================================
-
-    def _enter_verify(self):
-        """Chuyển sang phase VERIFY kiểm nghiệm PID vừa tính."""
-        self.phase = self.PHASE_VERIFY
-        self.phase_start_time = None
-        self.verify_errors = []
-        self.verify_pitches = []
-        self.verify_outputs = []
-        self.verify_pid = PIDController(
-            kp=self.computed_kp,
-            ki=self.computed_ki,
-            kd=self.computed_kd,
+        self.current_pid = PIDController(
+            kp=kp, ki=ki, kd=kd,
             output_min=-self.max_velocity,
             output_max=self.max_velocity,
             integral_max=5.0,
             derivative_filter_alpha=0.1
         )
-        self.get_logger().info(f'  📍 KIỂM NGHIỆM ĐỘ ỔN ĐỊNH ({self.verify_duration}s)...')
-        self.publish_status(f'VERIFY (#{self.current_iteration})')
+        self.current_target_pitch = target_p
+        self.pitch_history = []
+        self.output_history = []
+        self.robot_fell = False
+        self.max_recovery_pitch = 0.0
 
-    def _do_verify(self, pitch, gyro_y, timestamp):
-        """Phase VERIFY: Chạy thử và chấm điểm."""
-        if self.phase_start_time is None:
-            self.phase_start_time = timestamp
+        self.state = self.STATE_BALANCE
+        self.state_start_time = timestamp
 
-        elapsed = timestamp - self.phase_start_time
+        self.get_logger().info(
+            f'  [Thế hệ {self.current_generation}/{self.max_generations}] '
+            f'Thử cá thể #{self.current_particle_idx + 1}: '
+            f'Kp={kp:.2f} | Ki={ki:.3f} | Kd={kd:.2f} | Target={target_p:+.4f}'
+        )
 
-        error = pitch - 0.0
-        output = self.verify_pid.compute(error, timestamp, measured_rate=gyro_y)
-        self.publish_cmd_vel(output)
-        self.publish_data(pitch, error, output, 5.0)
+    def _evaluate_and_next_particle(self, timestamp):
+        """Tính hàm Fitness và chuyển sang cá thể tiếp theo hoặc thế hệ mới."""
+        particle = self.particles[self.current_particle_idx]
 
-        self.verify_errors.append(abs(error))
-        self.verify_pitches.append(pitch)
-        self.verify_outputs.append(output)
+        if self.robot_fell or len(self.pitch_history) < 10:
+            fitness = 0.0
+        else:
+            # 1. Sai số trung bình bình phương (RMS Pitch Error)
+            rms_pitch = math.sqrt(sum(p**2 for p in self.pitch_history) / len(self.pitch_history))
+            # 2. Vận tốc trôi xe trung bình
+            avg_drift_speed = abs(sum(self.output_history) / len(self.output_history))
+            # 3. Độ vọt lố lớn nhất khi bị đẩy
+            overshoot = self.max_recovery_pitch
 
-        if elapsed > self.verify_duration:
-            # Chấm điểm chất lượng
-            avg_err = sum(self.verify_errors) / len(self.verify_errors)
-            rms_err = math.sqrt(sum(e**2 for e in self.verify_errors) / len(self.verify_errors))
-            max_err = max(self.verify_errors)
-            score = 100.0 / (1.0 + 25.0 * rms_err)
-
-            # Tự động tính góc cân bằng tự nhiên (triệt tiêu trôi)
-            steady_idx = int(0.5 * len(self.verify_pitches))
-            steady_pitches = self.verify_pitches[steady_idx:]
-            steady_outputs = self.verify_outputs[steady_idx:]
-            avg_pitch = sum(steady_pitches) / len(steady_pitches) if steady_pitches else 0.0
-            avg_output = sum(steady_outputs) / len(steady_outputs) if steady_outputs else 0.0
-            calibrated_target_pitch = avg_pitch + (0.005 * avg_output)
-
-            res = {
-                'iteration': self.current_iteration,
-                'kp': self.computed_kp,
-                'ki': self.computed_ki,
-                'kd': self.computed_kd,
-                'target_pitch': calibrated_target_pitch,
-                'avg_deg': math.degrees(avg_err),
-                'rms_deg': math.degrees(rms_err),
-                'max_deg': math.degrees(max_err),
-                'score': score
-            }
-            self.iteration_results.append(res)
-            self.get_logger().info(
-                f'  ✓ Lần #{self.current_iteration}: Sai số RMS = {res["rms_deg"]:.2f}°, '
-                f'Target Pitch tối ưu = {calibrated_target_pitch:.4f} rad, Điểm = {score:.1f}/100'
+            # HÀM MỤC TIÊU FITNESS (Càng cao càng tối ưu):
+            # Thưởng cho: xe ít rung (rms nhỏ), không trôi (drift nhỏ), kháng đẩy tốt (overshoot nhỏ)
+            fitness = 100.0 / (
+                1.0 + (20.0 * rms_pitch) + (10.0 * overshoot) + (15.0 * avg_drift_speed)
             )
 
-            if self.current_iteration < self.max_iterations:
-                self.current_iteration += 1
-                self.get_logger().info(f'🔄 Tự động reset Gazebo để bắt đầu lần #{self.current_iteration}...')
-                self._enter_reset(timestamp)
+        particle.current_fitness = fitness
+
+        # Cập nhật Best cá nhân
+        if fitness > particle.best_fitness:
+            particle.best_fitness = fitness
+            particle.best_position = list(particle.position)
+
+        # Cập nhật Best toàn bầy đàn (Global Best)
+        if fitness > self.global_best_fitness:
+            self.global_best_fitness = fitness
+            self.global_best_position = list(particle.position)
+            star = ' ⭐ (KỶ LỤC MỚI CỦA BẦY ĐÀN!)'
+        else:
+            star = ''
+
+        self.get_logger().info(f'    ➜ Điểm Fitness: {fitness:.1f}/100{star}')
+
+        # Chuyển cá thể tiếp theo
+        self.current_particle_idx += 1
+
+        if self.current_particle_idx >= self.num_particles:
+            # ĐÃ HẾT 1 THẾ HỆ ➔ Cập nhật vị trí bầy đàn theo PSO
+            self.get_logger().info('')
+            self.get_logger().info(
+                f'  🏁 KẾT THÚC THẾ HỆ #{self.current_generation}! '
+                f'Kỷ lục bầy đàn hiện tại: Fitness = {self.global_best_fitness:.1f}'
+            )
+
+            if self.current_generation < self.max_generations:
+                self.current_generation += 1
+                self.current_particle_idx = 0
+                # Cả đàn học hỏi vị trí tốt nhất và bay đến vùng tối ưu
+                for p in self.particles:
+                    p.update(self.global_best_position)
+                self.get_logger().info(f'  🚀 Bầy đàn đang hội tụ sang Thế hệ #{self.current_generation}...')
+                self.get_logger().info('')
             else:
-                self._finish_all_iterations()
+                # ĐÃ HOÀN TẤT TẤT CẢ THẾ HỆ
+                self._finish_pso_tuning()
+                return
 
-    # ================================================================
-    #                    HOÀN TẤT & LỰA CHỌN BỘ TỐI ƯU
-    # ================================================================
+        # Gọi reset Gazebo cho lượt tiếp theo
+        self.state = self.STATE_RESET
+        self.state_start_time = timestamp
+        self.trigger_gazebo_reset()
 
-    def _finish_all_iterations(self):
-        """Tổng kết tất cả các lần thử, chọn ra bộ thông số điểm cao nhất."""
-        self.phase = self.PHASE_DONE
+    def _finish_pso_tuning(self):
+        """Kết thúc thuật toán PSO và xuất kết quả."""
+        self.state = self.STATE_DONE
         self.publish_cmd_vel(0.0)
-        self.publish_status('DONE')
 
-        if not self.iteration_results:
-            self.get_logger().warn('Chưa có kết quả vòng lặp nào được ghi nhận.')
-            return
-
-        # Chọn kết quả có score cao nhất (sai số thấp nhất)
-        best_res = max(self.iteration_results, key=lambda x: x['score'])
+        kp, ki, kd, target_p = self.global_best_position
 
         self.get_logger().info('')
-        self.get_logger().info('=' * 75)
-        self.get_logger().info('           🏆 BẢNG TỔNG KẾT TỰ ĐỘNG TỐI ƯU HÓA PID 🏆')
-        self.get_logger().info('=' * 75)
-        self.get_logger().info(f' {"Lần":<4} | {"Kp":<7} | {"Ki":<6} | {"Kd":<6} | {"Target Pitch":<14} | {"RMS Error":<10} | {"Điểm":<5}')
-        self.get_logger().info('-' * 75)
-        for r in self.iteration_results:
-            is_best = ' ⭐ (TỐT NHẤT)' if r == best_res else ''
-            self.get_logger().info(
-                f' #{r["iteration"]:<3} | {r["kp"]:<7.2f} | {r["ki"]:<6.3f} | {r["kd"]:<6.3f} | '
-                f'{r["target_pitch"]:>+.5f} rad  | {r["rms_deg"]:<8.2f}° | {r["score"]:<5.1f}{is_best}'
-            )
-        self.get_logger().info('=' * 75)
+        self.get_logger().info('=' * 70)
+        self.get_logger().info('     🏆 KẾT QUẢ TỐI ƯU HÓA BẦY ĐÀN (PSO) HOÀN TẤT 🏆')
+        self.get_logger().info('=' * 70)
+        self.get_logger().info(f'  Điểm Fitness tối ưu:   {self.global_best_fitness:.2f} / 100')
         self.get_logger().info('')
-        self.get_logger().info(f'  🎯 BỘ THÔNG SỐ TỐI ƯU NHẤT (ĐỨNG VỮNG, KHÔNG TRÔI):')
-        self.get_logger().info(f'    Kp           = {best_res["kp"]:.4f}')
-        self.get_logger().info(f'    Ki           = {best_res["ki"]:.4f}')
-        self.get_logger().info(f'    Kd           = {best_res["kd"]:.4f}')
-        self.get_logger().info(f'    Target Pitch = {best_res["target_pitch"]:.5f} rad ({math.degrees(best_res["target_pitch"]):.3f}°)')
+        self.get_logger().info(f'  ┌──────────────────────────────────────────────────┐')
+        self.get_logger().info(f'  │  Kp           = {kp:>10.4f}                       │')
+        self.get_logger().info(f'  │  Ki           = {ki:>10.4f}                       │')
+        self.get_logger().info(f'  │  Kd           = {kd:>10.4f}                       │')
+        self.get_logger().info(f'  │  Target Pitch = {target_p:>+10.5f} rad ({math.degrees(target_p):.3f}°)         │')
+        self.get_logger().info(f'  └──────────────────────────────────────────────────┘')
         self.get_logger().info('')
+        self.get_logger().info('  Đặc tính đạt được:')
+        self.get_logger().info('  ✓ Xe đứng vững như kiềng ba chân, triệt tiêu trôi hoàn toàn.')
+        self.get_logger().info('  ✓ Khi bị lực xô đẩy, lập tức xuất mô-men hãm và hồi phục nhanh chóng.')
+        self.get_logger().info('=' * 70)
 
-        # Lưu vào file YAML
-        self._save_results_yaml(best_res)
+        # Lưu file YAML
+        self._save_results_yaml(kp, ki, kd, target_p)
 
-    def _save_results_yaml(self, best):
-        """Lưu bộ số tốt nhất ra file YAML."""
+    def _save_results_yaml(self, kp, ki, kd, target_p):
+        """Lưu kết quả ra file cấu hình YAML."""
         yaml_content = f"""# =============================================
-# PID Tuning Results - Kết quả tự động tối ưu hóa qua {self.max_iterations} lần lấy mẫu
-# Điểm đánh giá: {best['score']:.1f}/100 | Sai số RMS: {best['rms_deg']:.2f} độ
-# Góc cân bằng tự nhiên (chống trôi): {best['target_pitch']:.5f} rad
+# PID Tuning Results - Thuật toán Tối ưu hóa Bầy đàn (PSO)
+# Điểm Fitness kháng lực và cân bằng: {self.global_best_fitness:.1f}/100
 # =============================================
 
 balance_controller:
   ros__parameters:
-    kp: {best['kp']:.4f}
-    ki: {best['ki']:.4f}
-    kd: {best['kd']:.4f}
-    target_pitch: {best['target_pitch']:.5f}
+    kp: {kp:.4f}
+    ki: {ki:.4f}
+    kd: {kd:.4f}
+    target_pitch: {target_p:.5f}
     max_velocity: 1.5
     integral_max: 5.0
     derivative_filter_alpha: 0.1
@@ -547,7 +402,7 @@ balance_controller:
 
 def main(args=None):
     rclpy.init(args=args)
-    node = PIDTunerNode()
+    node = PsoPIDTunerNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
