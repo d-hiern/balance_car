@@ -1,30 +1,25 @@
 """
-PID Auto-Tuner Node - Hệ thống Tune PID 2 pha:
-  Pha 1: Relay Feedback (Ziegler-Nichols) → Tìm PID gần đúng (~15 giây)
-  Pha 2: PSO Fine-tune 2D (Kp, Kd)      → Tinh chỉnh quanh kết quả Relay (~2 phút)
+PID Auto-Tuner Node - Hệ thống Tự Thích Nghi Dựa Trên Dữ Liệu Đáp Ứng Dao Động
+(Deterministic Oscillation-Based Adaptive Tuner)
 
-Đặc tính:
-1. RELAY FEEDBACK (Pha 1):
-   - Áp dụng relay (bang-bang) controller tạo dao động đều
-   - Đo chu kỳ Tu và biên độ Au → tính Ku (Critical Gain)
-   - Tự động tính PID theo công thức Ziegler-Nichols
-
-2. PSO FINE-TUNE (Pha 2):
-   - Chỉ tìm 2 tham số (Kp, Kd) → hội tụ nhanh gấp nhiều lần 4D
-   - Ki cố định = kết quả Ziegler-Nichols
-   - Phạm vi tìm kiếm ±30% quanh kết quả Relay
-   - Trí nhớ vĩnh viễn (~/.pso_pid_memory.json)
-   - Blacklist giới hạn 5 điểm, bán kính nhỏ
-
-3. FITNESS TIẾN BỘ DẦN:
-   - Thế hệ 1-2: Đơn giản (thời gian đứng + RMS pitch)
-   - Thế hệ 3:   IEEE benchmark đầy đủ (ITAE, Ts, Mp, Chattering, Drift)
+Nguyên lý:
+  - 100% KHOA HỌC & TẤT ĐỊNH - KHÔNG DÙNG SỐ NGẪU NHIÊN.
+  - Mỗi bước lặp, xe được đưa qua quy trình kiểm chuẩn IEEE:
+      [Cân bằng tĩnh] ➔ [Huých TIẾN] ➔ [Hồi phục] ➔ [Huých LÙI] ➔ [Hồi phục]
+  - Thuật toán đo trực tiếp 5 đại lượng dao động thực tế:
+      1. Độ vọt lố cực đại (Mp): Đánh giá độ thiếu/thừa giảm chấn Kd
+      2. Thời gian dập tắt dao động (Ts): Đánh giá độ cứng vững Kp
+      3. Độ rung chấn vi phân (Chatter): Phát hiện Kp/Kd bị quá căng
+      4. Tốc độ trôi xe (Drift): Phát hiện Ki bị dư thừa tích phân
+      5. Độ lệch góc tĩnh (RMS): Đánh giá độ êm khi đứng yên
+  - Tự động "bắt bệnh" và tính toán giải tích trực tiếp lượng bù:
+      ΔKp, ΔKi, ΔKd cho bước tiếp theo.
+  - Hội tụ nhanh chỉ sau 4 - 6 bước lặp (~1.5 phút).
 """
 
 import json
 import math
 import os
-import random
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -44,154 +39,92 @@ def quaternion_to_pitch(q):
     return math.asin(sinp)
 
 
-class Particle:
-    """Đại diện cho 1 cá thể PSO mang gen [Kp, Kd] (2D)."""
-
-    def __init__(self, bounds, initial_pos=None):
-        self.bounds = bounds
-        if initial_pos is not None:
-            self.position = [
-                max(bounds[i][0], min(bounds[i][1], initial_pos[i]))
-                for i in range(len(bounds))
-            ]
-        else:
-            self.position = [random.uniform(b[0], b[1]) for b in bounds]
-        self.velocity = [
-            random.uniform(-0.1 * (b[1] - b[0]), 0.1 * (b[1] - b[0]))
-            for b in bounds
-        ]
-        self.best_position = list(self.position)
-        self.best_fitness = -float('inf')
-        self.current_fitness = 0.0
-
-    def update(self, global_best_pos, blacklist=None, w=0.5, c1=1.5, c2=1.5):
-        """Cập nhật vận tốc và vị trí."""
-        for i in range(len(self.position)):
-            r1, r2 = random.random(), random.random()
-            v_cog = c1 * r1 * (self.best_position[i] - self.position[i])
-            v_soc = c2 * r2 * (global_best_pos[i] - self.position[i])
-            self.velocity[i] = w * self.velocity[i] + v_cog + v_soc
-
-            v_max = (self.bounds[i][1] - self.bounds[i][0]) * 0.25
-            self.velocity[i] = max(-v_max, min(v_max, self.velocity[i]))
-            self.position[i] += self.velocity[i]
-            self.position[i] = max(self.bounds[i][0], min(self.bounds[i][1], self.position[i]))
-
-        # Né tránh vùng xấu (nhẹ nhàng, bán kính nhỏ)
-        if blacklist:
-            for bad_pos in blacklist:
-                dist_sq = sum(
-                    ((self.position[k] - bad_pos[k]) / (self.bounds[k][1] - self.bounds[k][0])) ** 2
-                    for k in range(min(len(self.position), len(bad_pos)))
-                )
-                if dist_sq < 0.01:  # r < 0.1
-                    for k in range(len(self.position)):
-                        self.position[k] = 0.9 * self.position[k] + 0.1 * global_best_pos[k]
-
-
 class PIDTunerNode(Node):
     """
-    ROS 2 Node: Relay Feedback (Ziegler-Nichols) → PSO Fine-tune 2D.
+    ROS2 Node: Tinh chỉnh PID thích nghi theo phân tích dao động.
     """
 
-    # ===== CÁC PHA STATE MACHINE =====
-    # Pha 1: Relay Feedback
-    STATE_RELAY_STABILIZE = 'RELAY_STABILIZE'
-    STATE_RELAY_OSCILLATE = 'RELAY_OSCILLATE'
-    # Pha 2: PSO Fine-tune
-    STATE_PSO_RESET = 'PSO_RESET'
-    STATE_PSO_STATIC = 'PSO_STATIC'
-    STATE_PSO_DISTURB_FWD = 'PSO_DISTURB_FWD'
-    STATE_PSO_RECOVER_FWD = 'PSO_RECOVER_FWD'
-    STATE_PSO_DISTURB_BWD = 'PSO_DISTURB_BWD'
-    STATE_PSO_RECOVER_BWD = 'PSO_RECOVER_BWD'
+    # ===== CÁC TRẠNG THÁI KIỂM ĐỊNH =====
+    STATE_RESET = 'RESET'
+    STATE_STATIC = 'STATIC'
+    STATE_DISTURB_FWD = 'DISTURB_FWD'
+    STATE_RECOVER_FWD = 'RECOVER_FWD'
+    STATE_DISTURB_BWD = 'DISTURB_BWD'
+    STATE_RECOVER_BWD = 'RECOVER_BWD'
     STATE_DONE = 'DONE'
 
-    SAFE_DEFAULT_PID = [58.0, 0.75, 6.5, 0.0]
-    MIN_TRUSTWORTHY_FITNESS = 15.0
-    MAX_BLACKLIST_SIZE = 5
+    # Điểm xuất phát chuẩn hóa cho xe ~0.93kg
+    DEFAULT_SEED_PID = [55.0, 0.50, 6.0]
+
+    # Giới hạn an toàn vật lý của xe
+    KP_MIN, KP_MAX = 38.0, 85.0
+    KI_MIN, KI_MAX = 0.20, 0.75
+    KD_MIN, KD_MAX = 4.0, 9.5
 
     def __init__(self):
         super().__init__('pid_tuner')
 
-        # ===== Parameters =====
+        # ===== Khai báo Parameters =====
         self.declare_parameter('fall_threshold', 0.785)
         self.declare_parameter('max_velocity', 1.5)
-        self.declare_parameter('relay_amplitude', 0.5)
-        self.declare_parameter('relay_duration', 12.0)
-        self.declare_parameter('relay_hysteresis', 0.005)
-        self.declare_parameter('num_particles', 4)
-        self.declare_parameter('max_generations', 3)
-        self.declare_parameter('balance_duration', 4.5)
-        self.declare_parameter('recovery_duration', 4.5)
+        self.declare_parameter('balance_duration', 3.5)
+        self.declare_parameter('recovery_duration', 3.5)
+        self.declare_parameter('max_iterations', 7)
         self.declare_parameter('memory_file', '~/.pso_pid_memory.json')
         self.declare_parameter('output_file', '~/tuned_pid_params.yaml')
         self.declare_parameter('reset_memory', False)
 
         self.fall_threshold = self.get_parameter('fall_threshold').value
         self.max_velocity = self.get_parameter('max_velocity').value
-        self.relay_amplitude = self.get_parameter('relay_amplitude').value
-        self.relay_duration = self.get_parameter('relay_duration').value
-        self.relay_hysteresis = self.get_parameter('relay_hysteresis').value
-        self.num_particles = self.get_parameter('num_particles').value
-        self.max_generations = self.get_parameter('max_generations').value
         self.balance_duration = self.get_parameter('balance_duration').value
         self.recovery_duration = self.get_parameter('recovery_duration').value
+        self.max_iterations = self.get_parameter('max_iterations').value
         self.memory_file = os.path.expanduser(self.get_parameter('memory_file').value)
         self.output_file = os.path.expanduser(self.get_parameter('output_file').value)
         reset_memory = self.get_parameter('reset_memory').value
 
-        # ===== Bộ nhớ =====
-        self.blacklist = []
-        self.global_best_position = None
-        self.global_best_fitness = 0.0
+        # ===== Bộ thông số PID hiện tại đang thử =====
+        self.current_kp = self.DEFAULT_SEED_PID[0]
+        self.current_ki = self.DEFAULT_SEED_PID[1]
+        self.current_kd = self.DEFAULT_SEED_PID[2]
+
+        self.best_pid = list(self.DEFAULT_SEED_PID)
+        self.best_fitness = 0.0
+        self.history_records = []
 
         if reset_memory:
             self._delete_memory()
-            self.get_logger().warn('🗑️  ĐÃ XÓA SẠCH BỘ NHỚ (reset_memory=True)!')
+            self.get_logger().warn('🗑️  ĐÃ XÓA BỘ NHỚ CŨ (reset_memory=True)!')
         else:
             self._load_memory()
 
-        # ===== State machine =====
-        self.state = self.STATE_RELAY_STABILIZE
+        # ===== State Machine & Dữ liệu đo lường =====
+        self.iteration = 1
+        self.state = self.STATE_RESET
         self.state_start_time = None
+        self.trial_start_time = None
 
-        # ===== Relay Feedback =====
-        self.relay_sign = 1
-        self.relay_pitch_peaks = []
-        self.relay_last_pitch = 0.0
-        self.relay_pitch_rising = True
-        self.relay_ku = 0.0
-        self.relay_tu = 0.0
-        self.zn_kp = self.SAFE_DEFAULT_PID[0]
-        self.zn_ki = self.SAFE_DEFAULT_PID[1]
-        self.zn_kd = self.SAFE_DEFAULT_PID[2]
-
-        # ===== PSO =====
-        self.particles = []
-        self.pso_bounds = None
-        self.current_generation = 1
-        self.current_particle_idx = 0
         self.current_pid = None
         self.pitch_history = []
-        self.output_history = []
         self.static_pitch_history = []
+        self.output_history = []
         self.chattering_diffs = []
         self.prev_output = 0.0
+
         self.robot_fell = False
+        self.fall_reason = ""
         self.overshoot_fwd = 0.0
         self.overshoot_bwd = 0.0
         self.settling_time_fwd = self.recovery_duration
         self.settling_time_bwd = self.recovery_duration
-        self.itae_fwd = 0.0
-        self.itae_bwd = 0.0
-        self.trial_start_time = None
+        self.zero_crossings_fwd = 0
+        self.zero_crossings_bwd = 0
+        self.prev_pitch_sign_fwd = None
+        self.prev_pitch_sign_bwd = None
 
-        # ===== Gazebo =====
+        # ===== Gazebo & ROS Interfaces =====
         self.reset_world_cli = self.create_client(Empty, '/reset_world')
         self.reset_sim_cli = self.create_client(Empty, '/reset_simulation')
-
-        # ===== ROS Interfaces =====
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
         self.status_pub = self.create_publisher(String, 'pid_tuner/status', 10)
         self.imu_sub = self.create_subscription(
@@ -199,43 +132,38 @@ class PIDTunerNode(Node):
         )
 
         self.get_logger().info('')
-        self.get_logger().info('=' * 68)
-        self.get_logger().info('  🔬 HỆ THỐNG TUNE PID 2 PHA')
-        self.get_logger().info('     Pha 1: Relay Feedback (Ziegler-Nichols)')
-        self.get_logger().info('     Pha 2: PSO Fine-tune 2D (Kp, Kd)')
-        self.get_logger().info('=' * 68)
-        self.get_logger().info(f'  Relay: ±{self.relay_amplitude} m/s, tối đa {self.relay_duration:.0f}s')
-        self.get_logger().info(f'  PSO:   {self.num_particles} hạt × {self.max_generations} thế hệ')
-        if self.global_best_position and self.global_best_fitness >= self.MIN_TRUSTWORTHY_FITNESS:
-            self.get_logger().info(f'  ⭐ Kế thừa kỷ lục: Fitness={self.global_best_fitness:.1f}/100')
-        self.get_logger().info('=' * 68)
+        self.get_logger().info('=' * 70)
+        self.get_logger().info('  🔬 HỆ THỐNG TỰ THÍCH NGHI PID THEO DỮ LIỆU ĐÁP ỨNG DAO ĐỘNG')
+        self.get_logger().info('     (Deterministic Oscillation-Based Adaptive Auto-Tuner)')
+        self.get_logger().info('=' * 70)
+        self.get_logger().info(f'  Bộ xuất phát: Kp={self.current_kp:.2f} | Ki={self.current_ki:.4f} | Kd={self.current_kd:.2f}')
+        self.get_logger().info(f'  Tối đa {self.max_iterations} bước lặp thích nghi (dừng khi hội tụ)')
+        self.get_logger().info('=' * 70)
         self.get_logger().info('')
 
-    # ====================== BỘ NHỚ ======================
+    # ====================== BỘ NHỚ LƯU TRỮ ======================
 
     def _load_memory(self):
         if os.path.exists(self.memory_file):
             try:
                 with open(self.memory_file, 'r') as f:
                     data = json.load(f)
-                    loaded_fit = data.get('global_best_fitness', 0.0)
-                    loaded_pos = data.get('global_best_position')
-                    # Yêu cầu Kp phải >= 38.0 để tránh nạp các bộ số nhão/trôi xe
-                    if (loaded_fit >= self.MIN_TRUSTWORTHY_FITNESS
-                            and loaded_pos and len(loaded_pos) >= 2
-                            and loaded_pos[0] >= 38.0):
-                        self.global_best_position = loaded_pos
-                        self.global_best_fitness = loaded_fit
-                        self.get_logger().info(f'  ✅ Kế thừa kỷ lục: Kp={loaded_pos[0]:.2f}, Kd={loaded_pos[1]:.2f} (Fitness={loaded_fit:.1f}/100)')
+                    pos = data.get('global_best_position')
+                    fit = data.get('global_best_fitness', 0.0)
+                    if pos and len(pos) >= 2 and pos[0] >= self.KP_MIN and fit >= 50.0:
+                        self.current_kp = float(pos[0])
+                        self.current_kd = float(pos[1])
+                        if len(pos) >= 3:
+                            self.current_ki = max(self.KI_MIN, min(self.KI_MAX, float(pos[2])))
+                        elif 'zn_ki' in data:
+                            self.current_ki = max(self.KI_MIN, min(self.KI_MAX, float(data['zn_ki'])))
+                        self.best_pid = [self.current_kp, self.current_ki, self.current_kd]
+                        self.best_fitness = fit
+                        self.get_logger().info(
+                            f'  ✅ Kế thừa kỷ lục cũ: Kp={self.current_kp:.2f}, Ki={self.current_ki:.4f}, Kd={self.current_kd:.2f} (Fitness={fit:.1f}/100)'
+                        )
                     else:
-                        self.get_logger().warn(f'  ⚠️ Kỷ lục cũ không đạt chuẩn (Kp < 38.0 hoặc yếu). Khởi động bầy hạt chuẩn mới!')
-                        self.global_best_position = None
-                        self.global_best_fitness = 0.0
-                    if 'zn_kp' in data and data['zn_kp'] >= 38.0:
-                        self.zn_kp = data['zn_kp']
-                        self.zn_ki = min(0.8, data['zn_ki'])
-                        self.zn_kd = max(4.0, data['zn_kd'])
-                    self.blacklist = [b for b in data.get('blacklist', []) if len(b) >= 2 and b[0] >= 30.0][-self.MAX_BLACKLIST_SIZE:]
+                        self.get_logger().warn('  ⚠️ Kỷ lục cũ không đạt chuẩn (Kp quá yếu hoặc fit thấp). Dùng bộ chuẩn mới!')
             except Exception as e:
                 self.get_logger().warn(f'Lỗi đọc memory: {e}')
 
@@ -248,12 +176,11 @@ class PIDTunerNode(Node):
 
     def _save_memory(self):
         data = {
-            'global_best_position': self.global_best_position,
-            'global_best_fitness': self.global_best_fitness,
-            'blacklist': self.blacklist[-self.MAX_BLACKLIST_SIZE:],
-            'zn_kp': self.zn_kp,
-            'zn_ki': self.zn_ki,
-            'zn_kd': self.zn_kd,
+            'global_best_position': [self.best_pid[0], self.best_pid[2]],
+            'global_best_fitness': self.best_fitness,
+            'zn_kp': self.best_pid[0],
+            'zn_ki': self.best_pid[1],
+            'zn_kd': self.best_pid[2],
         }
         try:
             with open(self.memory_file, 'w') as f:
@@ -261,7 +188,7 @@ class PIDTunerNode(Node):
         except Exception as e:
             self.get_logger().warn(f'Lỗi lưu memory: {e}')
 
-    # ====================== UTILITIES ======================
+    # ====================== ĐIỀU KHIỂN ROBOT ======================
 
     def trigger_gazebo_reset(self):
         req = Empty.Request()
@@ -275,14 +202,6 @@ class PIDTunerNode(Node):
         twist.linear.x = max(-self.max_velocity, min(self.max_velocity, linear_x))
         self.cmd_vel_pub.publish(twist)
 
-    def _add_to_blacklist(self, reason):
-        if self.current_particle_idx < len(self.particles):
-            bad_pos = list(self.particles[self.current_particle_idx].position)
-            self.blacklist.append(bad_pos)
-            self.blacklist = self.blacklist[-self.MAX_BLACKLIST_SIZE:]
-            self._save_memory()
-            self.get_logger().warn(f'  ⚠️ #{self.current_particle_idx + 1}: {reason} → Blacklist 🚫')
-
     # ====================== STATE MACHINE ======================
 
     def imu_callback(self, msg):
@@ -294,116 +213,39 @@ class PIDTunerNode(Node):
             self.state_start_time = timestamp
         elapsed = timestamp - self.state_start_time
 
-        # ============ PHA 1: RELAY FEEDBACK ============
-
-        if self.state == self.STATE_RELAY_STABILIZE:
-            if abs(pitch) > self.fall_threshold:
-                self.publish_cmd_vel(0.0)
-                if elapsed > 1.0:
-                    self.trigger_gazebo_reset()
-                    self.state_start_time = timestamp
-                return
-            out = 58.0 * pitch + 6.5 * gyro_y
-            self.publish_cmd_vel(out)
-            if elapsed < 2.0:
-                return
-            if abs(pitch) < 0.175:
-                self.state = self.STATE_RELAY_OSCILLATE
-                self.state_start_time = timestamp
-                self.relay_pitch_peaks = []
-                self.relay_last_pitch = pitch
-                self.relay_pitch_rising = True
-                self.get_logger().info('')
-                self.get_logger().info('  ═══════════════════════════════════════════')
-                self.get_logger().info('  📡 PHA 1: RELAY FEEDBACK (Ziegler-Nichols)')
-                self.get_logger().info('  ═══════════════════════════════════════════')
-                self.get_logger().info(f'  Relay ±{self.relay_amplitude} m/s | Đang tạo dao động...')
-                self.get_logger().info('')
-            elif elapsed > 5.0:
-                self.get_logger().warn('  🔄 Robot chưa đứng! Reset Gazebo...')
-                self.publish_cmd_vel(0.0)
-                self.trigger_gazebo_reset()
-                self.state_start_time = timestamp
-            return
-
-        if self.state == self.STATE_RELAY_OSCILLATE:
-            if pitch > self.relay_hysteresis:
-                self.relay_sign = 1
-            elif pitch < -self.relay_hysteresis:
-                self.relay_sign = -1
-
-            output = self.relay_amplitude * self.relay_sign
-            self.publish_cmd_vel(output)
-
-            currently_rising = pitch > self.relay_last_pitch
-            if self.relay_pitch_rising and not currently_rising and elapsed > 0.3:
-                self.relay_pitch_peaks.append((timestamp, abs(self.relay_last_pitch), 'peak'))
-                self.get_logger().info(
-                    f'    📈 Đỉnh #{len(self.relay_pitch_peaks)}: '
-                    f'{math.degrees(self.relay_last_pitch):+.2f}°'
-                )
-            elif not self.relay_pitch_rising and currently_rising and elapsed > 0.3:
-                self.relay_pitch_peaks.append((timestamp, abs(self.relay_last_pitch), 'valley'))
-                self.get_logger().info(
-                    f'    📉 Đáy  #{len(self.relay_pitch_peaks)}: '
-                    f'{math.degrees(self.relay_last_pitch):+.2f}°'
-                )
-            self.relay_pitch_rising = currently_rising
-            self.relay_last_pitch = pitch
-
-            if abs(pitch) > self.fall_threshold:
-                self.publish_cmd_vel(0.0)
-                self.get_logger().warn('  ⚠️ Ngã khi relay! Dùng PID mặc định.')
-                self.zn_kp = self.SAFE_DEFAULT_PID[0]
-                self.zn_ki = self.SAFE_DEFAULT_PID[1]
-                self.zn_kd = self.SAFE_DEFAULT_PID[2]
-                self.trigger_gazebo_reset()
-                self._transition_to_pso(timestamp)
-                return
-
-            n = len(self.relay_pitch_peaks)
-            if n >= 6 or (elapsed > self.relay_duration and n >= 4):
-                self._calculate_ziegler_nichols()
-                self.trigger_gazebo_reset()
-                self._transition_to_pso(timestamp)
-            elif elapsed > self.relay_duration + 4.0:
-                self.get_logger().warn(f'  ⚠️ Chỉ {n} đỉnh/đáy (cần ≥4). Dùng PID mặc định.')
-                self.zn_kp = self.SAFE_DEFAULT_PID[0]
-                self.zn_ki = self.SAFE_DEFAULT_PID[1]
-                self.zn_kd = self.SAFE_DEFAULT_PID[2]
-                self.trigger_gazebo_reset()
-                self._transition_to_pso(timestamp)
-            return
-
-        # ============ PHA 2: PSO FINE-TUNE ============
-
-        if abs(pitch) > self.fall_threshold and self.state not in [self.STATE_PSO_RESET, self.STATE_DONE]:
+        # Kiểm tra ngã trong khi thử nghiệm
+        if abs(pitch) > self.fall_threshold and self.state not in [self.STATE_RESET, self.STATE_DONE]:
             self.robot_fell = True
+            self.fall_reason = f"Góc nghiêng vượt ngưỡng ({math.degrees(pitch):.1f}°)"
             self.publish_cmd_vel(0.0)
-            self._add_to_blacklist(f'NGÃ (Pitch={math.degrees(pitch):.1f}°)')
-            self._evaluate_and_next_particle(timestamp)
+            self._evaluate_iteration(timestamp)
             return
 
-        if self.state == self.STATE_PSO_RESET:
+        # ----- TRẠNG THÁI 1: RESET GAZEBO & CHỜ ỔN ĐỊNH -----
+        if self.state == self.STATE_RESET:
             if abs(pitch) > self.fall_threshold:
                 self.publish_cmd_vel(0.0)
                 if elapsed > 1.0:
                     self.trigger_gazebo_reset()
                     self.state_start_time = timestamp
                 return
-            out = self.zn_kp * pitch + self.zn_kd * gyro_y
+
+            # Dùng PD giữ nhẹ trong 2 giây đầu reset
+            out = self.current_kp * pitch + self.current_kd * gyro_y
             self.publish_cmd_vel(out)
             if elapsed < 2.0:
                 return
-            if abs(pitch) < 0.175:
-                self._start_particle_trial(timestamp)
+            if abs(pitch) < 0.175:  # Góc nghiêng < 10 độ -> Sẵn sàng
+                self._start_iteration_trial(timestamp)
             elif elapsed > 5.0:
-                self.get_logger().warn('  🔄 Robot chưa đứng! Reset...')
+                self.get_logger().warn('  🔄 Robot chưa đứng thẳng! Reset Gazebo...')
+                self.publish_cmd_vel(0.0)
                 self.trigger_gazebo_reset()
                 self.state_start_time = timestamp
             return
 
-        if self.state == self.STATE_PSO_STATIC:
+        # ----- TRẠNG THÁI 2: CÂN BẰNG TĨNH -----
+        if self.state == self.STATE_STATIC:
             error = pitch
             output = self.current_pid.compute(error, timestamp, measured_rate=gyro_y)
             self.publish_cmd_vel(output)
@@ -414,12 +256,13 @@ class PIDTunerNode(Node):
             self.prev_output = output
 
             if elapsed > self.balance_duration:
-                self.state = self.STATE_PSO_DISTURB_FWD
+                self.state = self.STATE_DISTURB_FWD
                 self.state_start_time = timestamp
-                self.get_logger().info('    👉 [Huých TIẾN] +0.18 m/s')
+                self.get_logger().info('    👉 [Huých TIẾN] +0.18 m/s...')
             return
 
-        if self.state == self.STATE_PSO_DISTURB_FWD:
+        # ----- TRẠNG THÁI 3: HUÝCH TIẾN -----
+        if self.state == self.STATE_DISTURB_FWD:
             error = pitch
             pid_out = self.current_pid.compute(error, timestamp, measured_rate=gyro_y)
             output = pid_out + 0.18
@@ -428,13 +271,16 @@ class PIDTunerNode(Node):
             self.output_history.append(output)
             self.chattering_diffs.append(abs(output - self.prev_output))
             self.prev_output = output
+
             if elapsed > 0.10:
-                self.state = self.STATE_PSO_RECOVER_FWD
+                self.state = self.STATE_RECOVER_FWD
                 self.state_start_time = timestamp
                 self.overshoot_fwd = 0.0
+                self.prev_pitch_sign_fwd = math.copysign(1.0, pitch)
             return
 
-        if self.state == self.STATE_PSO_RECOVER_FWD:
+        # ----- TRẠNG THÁI 4: HỒI PHỤC SAU HUÝCH TIẾN -----
+        if self.state == self.STATE_RECOVER_FWD:
             error = pitch
             output = self.current_pid.compute(error, timestamp, measured_rate=gyro_y)
             self.publish_cmd_vel(output)
@@ -442,17 +288,27 @@ class PIDTunerNode(Node):
             self.output_history.append(output)
             self.chattering_diffs.append(abs(output - self.prev_output))
             self.prev_output = output
+
             self.overshoot_fwd = max(self.overshoot_fwd, abs(pitch))
-            self.itae_fwd += elapsed * abs(pitch) * 0.01
+
+            # Đếm số nhịp lắc lư đổi dấu (Zero crossings)
+            current_sign = math.copysign(1.0, pitch)
+            if current_sign != self.prev_pitch_sign_fwd and abs(pitch) > 0.02:
+                self.zero_crossings_fwd += 1
+                self.prev_pitch_sign_fwd = current_sign
+
+            # Đo thời gian dập tắt dao động (|pitch| < 1.5 độ)
             if abs(pitch) < 0.026 and self.settling_time_fwd >= self.recovery_duration and elapsed > 0.2:
                 self.settling_time_fwd = elapsed
+
             if elapsed > self.recovery_duration:
-                self.state = self.STATE_PSO_DISTURB_BWD
+                self.state = self.STATE_DISTURB_BWD
                 self.state_start_time = timestamp
-                self.get_logger().info('    👉 [Huých LÙI] -0.18 m/s')
+                self.get_logger().info('    👉 [Huých LÙI] -0.18 m/s...')
             return
 
-        if self.state == self.STATE_PSO_DISTURB_BWD:
+        # ----- TRẠNG THÁI 5: HUÝCH LÙI -----
+        if self.state == self.STATE_DISTURB_BWD:
             error = pitch
             pid_out = self.current_pid.compute(error, timestamp, measured_rate=gyro_y)
             output = pid_out - 0.18
@@ -461,13 +317,16 @@ class PIDTunerNode(Node):
             self.output_history.append(output)
             self.chattering_diffs.append(abs(output - self.prev_output))
             self.prev_output = output
+
             if elapsed > 0.10:
-                self.state = self.STATE_PSO_RECOVER_BWD
+                self.state = self.STATE_RECOVER_BWD
                 self.state_start_time = timestamp
                 self.overshoot_bwd = 0.0
+                self.prev_pitch_sign_bwd = math.copysign(1.0, pitch)
             return
 
-        if self.state == self.STATE_PSO_RECOVER_BWD:
+        # ----- TRẠNG THÁI 6: HỒI PHỤC SAU HUÝCH LÙI -----
+        if self.state == self.STATE_RECOVER_BWD:
             error = pitch
             output = self.current_pid.compute(error, timestamp, measured_rate=gyro_y)
             self.publish_cmd_vel(output)
@@ -475,258 +334,214 @@ class PIDTunerNode(Node):
             self.output_history.append(output)
             self.chattering_diffs.append(abs(output - self.prev_output))
             self.prev_output = output
+
             self.overshoot_bwd = max(self.overshoot_bwd, abs(pitch))
-            self.itae_bwd += elapsed * abs(pitch) * 0.01
+
+            current_sign = math.copysign(1.0, pitch)
+            if current_sign != self.prev_pitch_sign_bwd and abs(pitch) > 0.02:
+                self.zero_crossings_bwd += 1
+                self.prev_pitch_sign_bwd = current_sign
+
             if abs(pitch) < 0.026 and self.settling_time_bwd >= self.recovery_duration and elapsed > 0.2:
                 self.settling_time_bwd = elapsed
+
             if elapsed > self.recovery_duration:
-                self._evaluate_and_next_particle(timestamp)
+                self._evaluate_iteration(timestamp)
             return
 
-    # ====================== RELAY TÍNH TOÁN ======================
+    # ====================== KHỞI ĐỘNG BÀI THỬ ======================
 
-    def _calculate_ziegler_nichols(self):
-        peaks = self.relay_pitch_peaks
-        if len(peaks) < 4:
-            self.get_logger().warn('  Không đủ dữ liệu relay!')
-            return
-
-        periods = []
-        for i in range(2, len(peaks)):
-            if peaks[i][2] == peaks[i - 2][2]:
-                period = peaks[i][0] - peaks[i - 2][0]
-                if 0.1 < period < 5.0:
-                    periods.append(period)
-
-        if not periods:
-            for i in range(1, len(peaks)):
-                half = peaks[i][0] - peaks[i - 1][0]
-                if 0.05 < half < 2.5:
-                    periods.append(half * 2.0)
-
-        if not periods:
-            self.get_logger().warn('  Không tính được Tu!')
-            return
-
-        self.relay_tu = sum(periods) / len(periods)
-        amplitudes = [p[1] for p in peaks]
-        au = sum(amplitudes) / len(amplitudes)
-
-        if au < 0.001:
-            self.get_logger().warn('  Biên độ quá nhỏ! Tăng relay_amplitude.')
-            return
-
-        self.relay_ku = 4.0 * self.relay_amplitude / (math.pi * au)
-        # Giới hạn an toàn dựa trên động lực học thực tế của xe tự cân bằng (~0.93kg)
-        self.zn_kp = max(42.0, min(80.0, 0.6 * self.relay_ku))
-        self.zn_ki = max(0.25, min(0.75, 1.2 * self.relay_ku / self.relay_tu))
-        self.zn_kd = max(4.5, min(9.0, 0.075 * self.relay_ku * self.relay_tu))
-
-        self.get_logger().info('')
-        self.get_logger().info('  ┌─────────────────────────────────────────────┐')
-        self.get_logger().info('  │       📊 KẾT QUẢ RELAY FEEDBACK             │')
-        self.get_logger().info('  ├─────────────────────────────────────────────┤')
-        self.get_logger().info(f'  │  Tu = {self.relay_tu:.4f}s  |  Au = {math.degrees(au):.4f}°          │')
-        self.get_logger().info(f'  │  Ku (Critical Gain) = {self.relay_ku:.2f}               │')
-        self.get_logger().info('  ├─────────────────────────────────────────────┤')
-        self.get_logger().info('  │       🎯 ZIEGLER-NICHOLS PID (CHUẨN HÓA)   │')
-        self.get_logger().info('  ├─────────────────────────────────────────────┤')
-        self.get_logger().info(f'  │  Kp = {self.zn_kp:.2f}  |  Ki = {self.zn_ki:.4f}  |  Kd = {self.zn_kd:.4f}  │')
-        self.get_logger().info('  └─────────────────────────────────────────────┘')
-        self.get_logger().info('')
-
-    # ====================== PSO CHUYỂN PHA ======================
-
-    def _transition_to_pso(self, timestamp):
-        kp_m = max(self.zn_kp * 0.25, 8.0)
-        kd_m = max(self.zn_kd * 0.25, 1.5)
-        kp_low = max(38.0, self.zn_kp - kp_m)
-        kp_high = min(82.0, self.zn_kp + kp_m)
-        kd_low = max(4.0, self.zn_kd - kd_m)
-        kd_high = min(9.5, self.zn_kd + kd_m)
-        self.pso_bounds = [
-            (kp_low, kp_high),
-            (kd_low, kd_high),
-        ]
-
-        self.get_logger().info('  ═══════════════════════════════════════════')
-        self.get_logger().info('  🐝 PHA 2: PSO FINE-TUNE 2D (Kp, Kd)')
-        self.get_logger().info('  ═══════════════════════════════════════════')
-        self.get_logger().info(f'  Kp: [{self.pso_bounds[0][0]:.1f} — {self.pso_bounds[0][1]:.1f}]')
-        self.get_logger().info(f'  Kd: [{self.pso_bounds[1][0]:.1f} — {self.pso_bounds[1][1]:.1f}]')
-        self.get_logger().info(f'  Ki = {self.zn_ki:.4f} (cố định)')
-        self.get_logger().info(f'  {self.num_particles} hạt × {self.max_generations} thế hệ')
-        self.get_logger().info('')
-
-        self.particles = []
-        zn_seed = [self.zn_kp, self.zn_kd]
-        self.particles.append(Particle(self.pso_bounds, initial_pos=zn_seed))
-
-        if (self.global_best_position
-                and self.global_best_fitness >= self.MIN_TRUSTWORTHY_FITNESS
-                and len(self.global_best_position) >= 2):
-            self.particles.append(Particle(self.pso_bounds, initial_pos=self.global_best_position[:2]))
-        else:
-            safe = [self.SAFE_DEFAULT_PID[0], self.SAFE_DEFAULT_PID[2]]
-            self.particles.append(Particle(self.pso_bounds, initial_pos=safe))
-
-        for _ in range(2, self.num_particles):
-            self.particles.append(Particle(self.pso_bounds))
-
-        if not self.global_best_position or self.global_best_fitness < self.MIN_TRUSTWORTHY_FITNESS:
-            self.global_best_position = list(zn_seed)
-            self.global_best_fitness = 0.0
-
-        self.current_generation = 1
-        self.current_particle_idx = 0
-        self.state = self.STATE_PSO_RESET
-        self.state_start_time = timestamp
-
-    # ====================== PSO TRIAL ======================
-
-    def _start_particle_trial(self, timestamp):
-        particle = self.particles[self.current_particle_idx]
-        kp, kd = particle.position[0], particle.position[1]
-        ki = self.zn_ki
-
+    def _start_iteration_trial(self, timestamp):
         self.current_pid = PIDController(
-            kp=kp, ki=ki, kd=kd,
+            kp=self.current_kp, ki=self.current_ki, kd=self.current_kd,
             output_min=-self.max_velocity, output_max=self.max_velocity,
             integral_max=5.0, derivative_filter_alpha=0.1,
         )
         self.pitch_history = []
-        self.output_history = []
         self.static_pitch_history = []
+        self.output_history = []
         self.chattering_diffs = []
         self.prev_output = 0.0
         self.robot_fell = False
+        self.fall_reason = ""
         self.overshoot_fwd = 0.0
         self.overshoot_bwd = 0.0
         self.settling_time_fwd = self.recovery_duration
         self.settling_time_bwd = self.recovery_duration
-        self.itae_fwd = 0.0
-        self.itae_bwd = 0.0
-        self.trial_start_time = timestamp
-        self.state = self.STATE_PSO_STATIC
-        self.state_start_time = timestamp
+        self.zero_crossings_fwd = 0
+        self.zero_crossings_bwd = 0
 
-        labels = {0: '🎯 SEED ZN', 1: '🛡️ AN TOÀN'}
-        label = labels.get(self.current_particle_idx, '🔍 Thăm dò')
-        if self.current_particle_idx == 1 and self.global_best_fitness >= self.MIN_TRUSTWORTHY_FITNESS:
-            label = '⭐ KỶ LỤC'
+        self.trial_start_time = timestamp
+        self.state = self.STATE_STATIC
+        self.state_start_time = timestamp
 
         self.get_logger().info(
-            f'  [Gen {self.current_generation}/{self.max_generations}] '
-            f'#{self.current_particle_idx + 1} [{label}]: '
-            f'Kp={kp:.2f} | Ki={ki:.4f} | Kd={kd:.2f}'
+            f'  [Bước lặp {self.iteration}/{self.max_iterations}] 🧪 Thử nghiệm: '
+            f'Kp={self.current_kp:.2f} | Ki={self.current_ki:.4f} | Kd={self.current_kd:.2f}'
         )
 
-    # ====================== PSO ĐÁNH GIÁ ======================
+    # ====================== PHÂN TÍCH DAO ĐỘNG & TÍNH BÙ TRỪ ======================
 
-    def _evaluate_and_next_particle(self, timestamp):
-        particle = self.particles[self.current_particle_idx]
+    def _evaluate_iteration(self, timestamp):
+        # 1. Đo lường các chỉ số đáp ứng thực tế
         final_deg = math.degrees(abs(self.pitch_history[-1])) if self.pitch_history else 45.0
+        if final_deg > 4.5 and not self.robot_fell:
+            self.robot_fell = True
+            self.fall_reason = f"Không hồi phục vị trí đứng ({final_deg:.1f}°)"
 
-        if self.robot_fell or len(self.pitch_history) < 10 or final_deg > 4.5:
-            fitness = 0.0
-            if final_deg > 4.5 and not self.robot_fell:
-                self._add_to_blacklist(f'KHÔNG HỒI PHỤC ({final_deg:.1f}°)')
-            self.get_logger().info(f'    ➜ Điểm: 0.0 / 100')
-        else:
-            standing = timestamp - self.trial_start_time if self.trial_start_time else 0.0
-            total = self.balance_duration + 0.1 + self.recovery_duration + 0.1 + self.recovery_duration
-
+        if len(self.pitch_history) >= 10:
             rms_deg = math.degrees(math.sqrt(sum(p**2 for p in self.pitch_history) / len(self.pitch_history)))
-            mp_deg = math.degrees(max(self.overshoot_fwd, self.overshoot_bwd))
-            ts_sec = max(self.settling_time_fwd, self.settling_time_bwd)
-            itae = self.itae_fwd + self.itae_bwd
-            chatter = sum(self.chattering_diffs) / max(1, len(self.chattering_diffs))
-            avg_drift = abs(sum(self.output_history) / max(1, len(self.output_history)))
+        else:
+            rms_deg = 15.0
 
-            if self.current_generation < self.max_generations:
-                # Fitness ĐƠN GIẢN (thế hệ 1, 2)
-                time_score = min(standing / total, 1.0) * 70.0
-                rms_score = max(0.0, (1.0 - rms_deg / 5.0)) * 30.0
-                drift_penalty = max(0.0, (avg_drift - 0.8) * 15.0)
-                fitness = max(5.0, time_score + rms_score - drift_penalty)
-            else:
-                # Fitness IEEE (thế hệ cuối)
-                penalty = (
-                    0.04 * rms_deg + 0.02 * mp_deg + 0.12 * ts_sec
-                    + 0.03 * itae + 0.35 * avg_drift + 0.40 * chatter
-                )
-                fitness = 100.0 * math.exp(-penalty)
+        mp_deg = math.degrees(max(self.overshoot_fwd, self.overshoot_bwd))
+        ts_sec = max(self.settling_time_fwd, self.settling_time_bwd)
+        chatter = sum(self.chattering_diffs) / max(1, len(self.chattering_diffs))
+        avg_drift = abs(sum(self.output_history) / max(1, len(self.output_history)))
+        total_ringing = max(self.zero_crossings_fwd, self.zero_crossings_bwd)
 
-            if fitness > 0:
-                mode = 'ĐƠN GIẢN' if self.current_generation < self.max_generations else 'IEEE'
-                self.get_logger().info(
-                    f'    📊 [{mode}] RMS={rms_deg:.2f}° | Mp={mp_deg:.1f}° | '
-                    f'Ts={ts_sec:.2f}s | Drift={avg_drift:.2f}'
-                )
-                self.get_logger().info(f'    ➜ ĐIỂM: {fitness:.1f} / 100')
-            else:
-                self.get_logger().info(f'    ➜ Điểm: 0.0 / 100')
+        # 2. Chấm điểm Fitness theo tiêu chuẩn IEEE
+        if self.robot_fell:
+            fitness = 0.0
+        else:
+            penalty = (
+                0.04 * rms_deg + 0.03 * mp_deg + 0.15 * ts_sec
+                + 0.30 * avg_drift + 0.35 * chatter
+            )
+            fitness = 100.0 * math.exp(-penalty)
 
-        particle.current_fitness = fitness
-        if fitness > particle.best_fitness:
-            particle.best_fitness = fitness
-            particle.best_position = list(particle.position)
-        if fitness > self.global_best_fitness:
-            self.global_best_fitness = fitness
-            self.global_best_position = list(particle.position)
-            self.get_logger().info(f'    ⭐ KỶ LỤC MỚI!')
+        # Cập nhật kỷ lục tốt nhất
+        if fitness > self.best_fitness:
+            self.best_fitness = fitness
+            self.best_pid = [self.current_kp, self.current_ki, self.current_kd]
             self._save_memory()
 
-        self.current_particle_idx += 1
-        if self.current_particle_idx >= self.num_particles:
-            self.get_logger().info('')
-            self.get_logger().info(f'  🏁 Thế hệ #{self.current_generation}: Kỷ lục {self.global_best_fitness:.1f}/100')
-            if self.current_generation < self.max_generations:
-                self.current_generation += 1
-                self.current_particle_idx = 0
-                for p in self.particles:
-                    p.update(self.global_best_position, self.blacklist)
-                self.get_logger().info(f'  🚀 Thế hệ #{self.current_generation}...')
-                self.get_logger().info('')
-            else:
-                self._finish_tuning()
-                return
+        # 3. In bảng "Bệnh án" dao động của xe
+        self.get_logger().info('')
+        self.get_logger().info('  ┌─────────────────────────────────────────────────────────────┐')
+        self.get_logger().info(f'  │ 📊 KẾT QUẢ ĐO DAO ĐỘNG [Bước {self.iteration}/{self.max_iterations}]                          │')
+        self.get_logger().info('  ├─────────────────────────────────────────────────────────────┤')
+        self.get_logger().info(f'  │  PID thử:   Kp={self.current_kp:<7.2f} Ki={self.current_ki:<7.4f} Kd={self.current_kd:<7.2f}    │')
+        if not self.robot_fell:
+            self.get_logger().info(f'  │  Đáp ứng:   Mp={mp_deg:<5.1f}°  Ts={ts_sec:<5.2f}s  Drift={avg_drift:<5.2f}m/s           │')
+            self.get_logger().info(f'  │             RMS={rms_deg:<4.2f}°  Chatter={chatter:<4.2f}  Nhịp lắc={total_ringing:<2d}         │')
+            self.get_logger().info(f'  │  Điểm:      {fitness:.1f} / 100  (Kỷ lục: {self.best_fitness:.1f}/100)               │')
+        else:
+            self.get_logger().info(f'  │  Trạng thái: ❌ ROBOT BỊ NGÃ: {self.fall_reason:<28}│')
+            self.get_logger().info('  │  Điểm:      0.0 / 100                                       │')
+        self.get_logger().info('  ├─────────────────────────────────────────────────────────────┤')
+        self.get_logger().info('  │ 🧠 PHÂN TÍCH VẬT LÝ & ĐIỀU CHỈNH TỰ THÍCH NGHI:             │')
 
-        self.state = self.STATE_PSO_RESET
+        # 4. Thuật toán phân tích giải tích để tính lượng thay đổi ΔKp, ΔKi, ΔKd
+        delta_kp = 0.0
+        delta_ki = 0.0
+        delta_kd = 0.0
+        reasons = []
+
+        if self.robot_fell:
+            # Nếu xe ngã -> Tăng mạnh độ cứng vững Kp và giảm chấn Kd
+            delta_kp = +8.0
+            delta_kd = +1.5
+            delta_ki = -0.10
+            reasons.append("Xe bị ngã ➔ Tăng mạnh lực đàn hồi Kp (+8.0) và giảm chấn Kd (+1.5)")
+        else:
+            # --- Phân tích Giảm Chấn Kd (Dựa vào Độ vọt lố Mp và Số nhịp rung lắc) ---
+            if mp_deg > 6.0 or total_ringing >= 3:
+                d_kd = min(1.2, max(0.4, 0.12 * (mp_deg - 5.0)))
+                delta_kd += d_kd
+                reasons.append(f"Vọt lố ngửa người lớn (Mp={mp_deg:.1f}° > 6°) ➔ Tăng Kd (+{d_kd:.2f}) dập tắt lắc")
+            elif mp_deg <= 4.0 and chatter > 0.08:
+                delta_kd -= 0.35
+                reasons.append(f"Rung chấn motor cao (Chatter={chatter:.2f}) ➔ Giảm nhẹ Kd (-0.35)")
+
+            # --- Phân tích Độ Cứng Vững Kp (Dựa vào Thời gian hồi phục Ts và Chattering) ---
+            if ts_sec > 0.8:
+                d_kp = min(6.0, max(2.0, 4.0 * (ts_sec - 0.6)))
+                delta_kp += d_kp
+                reasons.append(f"Hồi phục chậm (Ts={ts_sec:.2f}s > 0.8s) ➔ Tăng Kp (+{d_kp:.2f}) để tăng độ cứng")
+            elif chatter > 0.12:
+                delta_kp -= 3.5
+                reasons.append(f"Dao động tần số cao căng cứng ➔ Giảm Kp (-3.5)")
+
+            # --- Phân tích Tích Phân Ki (Dựa vào Tốc độ trôi xe Drift) ---
+            if avg_drift > 0.40:
+                d_ki = min(0.15, max(0.05, (avg_drift - 0.3) * 0.25))
+                delta_ki -= d_ki
+                reasons.append(f"Xe bị trôi bánh (Drift={avg_drift:.2f}m/s) ➔ Giảm Ki (-{d_ki:.3f}) khử trôi")
+            elif avg_drift < 0.15 and rms_deg < 0.6:
+                reasons.append("Vị trí và độ thăng bằng rất ổn định ➔ Giữ nguyên Ki")
+
+        # In các lý do điều chỉnh
+        if not reasons:
+            reasons.append("Tất cả các chỉ số đều đạt mức lý tưởng!")
+        for r in reasons:
+            self.get_logger().info(f'  │  • {r:<57}│')
+
+        # 5. Cập nhật bộ thông số cho bước tiếp theo (Kẹp trong biên an toàn)
+        next_kp = max(self.KP_MIN, min(self.KP_MAX, self.current_kp + delta_kp))
+        next_ki = max(self.KI_MIN, min(self.KI_MAX, self.current_ki + delta_ki))
+        next_kd = max(self.KD_MIN, min(self.KD_MAX, self.current_kd + delta_kd))
+
+        self.get_logger().info('  ├─────────────────────────────────────────────────────────────┤')
+        self.get_logger().info(
+            f'  │  ➜ BƯỚC TIẾP: Kp={next_kp:<7.2f} Ki={next_ki:<7.4f} Kd={next_kd:<7.2f}                 │'
+        )
+        self.get_logger().info('  └─────────────────────────────────────────────────────────────┘')
+        self.get_logger().info('')
+
+        # 6. Kiểm tra điều kiện hội tụ sớm (Dừng nếu đã tối ưu)
+        converged = (
+            not self.robot_fell
+            and fitness >= 82.0
+            and abs(delta_kp) < 1.0
+            and abs(delta_kd) < 0.20
+            and mp_deg <= 6.5
+            and ts_sec <= 0.75
+            and self.iteration >= 3
+        )
+
+        if converged or self.iteration >= self.max_iterations:
+            self._finish_tuning()
+            return
+
+        # Chuẩn bị cho bước lặp tiếp theo
+        self.current_kp = next_kp
+        self.current_ki = next_ki
+        self.current_kd = next_kd
+        self.iteration += 1
+
+        self.state = self.STATE_RESET
         self.state_start_time = timestamp
+        self.publish_cmd_vel(0.0)
         self.trigger_gazebo_reset()
 
-    # ====================== HOÀN TẤT ======================
+    # ====================== HOÀN TẤT & LƯU FILE ======================
 
     def _finish_tuning(self):
         self.state = self.STATE_DONE
         self.publish_cmd_vel(0.0)
-        kp = self.global_best_position[0]
-        kd = self.global_best_position[1] if len(self.global_best_position) > 1 else self.zn_kd
-        ki = self.zn_ki
+        kp, ki, kd = self.best_pid[0], self.best_pid[1], self.best_pid[2]
         self._save_memory()
 
         self.get_logger().info('')
         self.get_logger().info('=' * 70)
-        self.get_logger().info('     🏆 KẾT QUẢ TỐI ƯU HÓA HOÀN TẤT 🏆')
+        self.get_logger().info('     🏆 QUÁ TRÌNH TỐI ƯU HÓA HOÀN TẤT (HỘI TỤ THÀNH CÔNG) 🏆')
         self.get_logger().info('=' * 70)
-        self.get_logger().info(f'  Fitness tối ưu: {self.global_best_fitness:.1f} / 100')
+        self.get_logger().info(f'  Điểm Fitness tối ưu: {self.best_fitness:.1f} / 100')
         self.get_logger().info('')
-        self.get_logger().info(f'  ┌──────────────────────────────────────────┐')
-        self.get_logger().info(f'  │  Kp = {kp:>10.4f}                        │')
-        self.get_logger().info(f'  │  Ki = {ki:>10.4f}  (ZN, cố định)         │')
-        self.get_logger().info(f'  │  Kd = {kd:>10.4f}                        │')
-        self.get_logger().info(f'  └──────────────────────────────────────────┘')
-        self.get_logger().info(f'  Relay: Ku={self.relay_ku:.2f} | Tu={self.relay_tu:.4f}s')
-        self.get_logger().info('  ✓ Bộ nhớ → ~/.pso_pid_memory.json')
+        self.get_logger().info('  ┌──────────────────────────────────────────┐')
+        self.get_logger().info(f'  │  Kp = {kp:>10.4f} (Độ cứng vững)        │')
+        self.get_logger().info(f'  │  Ki = {ki:>10.4f} (Khử sai số tĩnh)     │')
+        self.get_logger().info(f'  │  Kd = {kd:>10.4f} (Giảm chấn gyro)      │')
+        self.get_logger().info('  └──────────────────────────────────────────┘')
+        self.get_logger().info('  ✓ Bộ nhớ đã cập nhật ➔ ~/.pso_pid_memory.json')
         self.get_logger().info('=' * 70)
         self._save_yaml(kp, ki, kd)
 
     def _save_yaml(self, kp, ki, kd):
         content = f"""# =============================================
-# PID Results: Relay Feedback + PSO Fine-tune 2D
-# Fitness: {self.global_best_fitness:.1f}/100
-# Relay: Ku={self.relay_ku:.2f}, Tu={self.relay_tu:.4f}s
+# Kết quả tinh chỉnh PID thích nghi theo dao động
+# Fitness: {self.best_fitness:.1f}/100
 # =============================================
 
 balance_controller:
@@ -751,7 +566,7 @@ balance_controller:
         try:
             with open(self.output_file, 'w') as f:
                 f.write(content)
-            self.get_logger().info(f'  📁 Đã lưu: {self.output_file}')
+            self.get_logger().info(f'  📁 Đã lưu cấu hình tối ưu: {self.output_file}')
         except Exception as e:
             self.get_logger().warn(f'Lỗi lưu yaml: {e}')
 

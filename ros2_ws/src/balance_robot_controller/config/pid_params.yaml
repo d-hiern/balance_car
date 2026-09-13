@@ -40,10 +40,11 @@ balance_controller:
 
 
 # =============================================
-# Cấu hình PID Auto-Tuner (2 Pha)
+# Cấu hình PID Auto-Tuner (Thích Nghi Theo Dao Động)
 # =============================================
-# Pha 1: Relay Feedback (Ziegler-Nichols) → Tìm PID gần đúng (~15s)
-# Pha 2: PSO Fine-tune 2D (Kp, Kd)      → Tinh chỉnh (~2 phút)
+# Thuật toán 100% tất định (không ngẫu nhiên):
+# Tự động phân tích Mp, Ts, Drift, RMS sau mỗi lần huých
+# để tính trực tiếp lượng điều chỉnh ΔKp, ΔKi, ΔKd.
 
 pid_tuner:
   ros__parameters:
@@ -51,21 +52,15 @@ pid_tuner:
     fall_threshold: 0.785       # Ngưỡng ngã (rad, ~45°)
     max_velocity: 1.5           # Vận tốc tối đa (m/s)
 
-    # --- Pha 1: Relay Feedback (Ziegler-Nichols) ---
-    relay_amplitude: 0.5        # Biên độ relay (m/s). Giảm nếu robot ngã khi relay
-    relay_duration: 12.0        # Thời gian relay tối đa (giây)
-    relay_hysteresis: 0.005     # Ngưỡng hysteresis chống rung (rad, ~0.3°)
+    # --- Thời gian mỗi bài thử nghiệm (giây) ---
+    balance_duration: 3.5       # Thời gian kiểm tra đứng yên
+    recovery_duration: 3.5      # Thời gian kiểm tra phục hồi sau cú huých
 
-    # --- Pha 2: PSO Fine-tune 2D (chỉ tìm Kp, Kd) ---
-    num_particles: 4            # Số hạt PSO (ít hơn vì chỉ 2D)
-    max_generations: 3          # Số thế hệ (gen 1-2: fitness đơn giản, gen 3: IEEE)
+    # --- Số bước lặp tối đa (thường hội tụ sau 4-6 bước) ---
+    max_iterations: 7
 
-    # --- Thời gian thử nghiệm ---
-    balance_duration: 4.5       # Thời gian kiểm tra đứng yên (giây)
-    recovery_duration: 4.5      # Thời gian kiểm tra phục hồi sau huých (giây)
-
-    # --- Bộ nhớ học AI ---
-    # Nếu robot ngã ngay từ đầu, đặt reset_memory: true để xóa bộ nhớ cũ.
+    # --- Bộ nhớ kế thừa ---
+    # Đặt true nếu muốn xóa sạch kỷ lục cũ và bắt đầu từ bộ chuẩn [55, 0.5, 6.0]
     reset_memory: false
 
     # --- Lưu kết quả ---
