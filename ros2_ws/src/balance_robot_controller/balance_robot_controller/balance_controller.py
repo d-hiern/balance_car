@@ -281,8 +281,9 @@ class BalanceControllerNode(Node):
             if abs(pos_error) < 0.015:
                 pos_error = 0.0
 
-            # Khi xe trôi tới (v > 0) -> bù góc âm (ngửa người ra sau) để hãm phanh
-            pitch_adjust = - (self.kp_velocity * vel_error + self.kp_position * pos_error)
+            # Khi xe trôi tới (v > 0, x > 0) -> tăng pitch_adjust dương để error = pitch - target bị giảm âm
+            # -> output giảm âm -> bánh xe tự động phanh hãm và lùi lại vị trí gốc!
+            pitch_adjust = + (self.kp_velocity * vel_error + self.kp_position * pos_error)
             # Kẹp góc bù an toàn (mặc định tối đa ±3.5 độ)
             pitch_adjust = max(-self.max_pitch_adjustment, min(self.max_pitch_adjustment, pitch_adjust))
         else:
