@@ -56,8 +56,8 @@ class PIDTunerNode(Node):
     STATE_RECOVER_BWD = 'RECOVER_BWD'
     STATE_DONE = 'DONE'
 
-    # Cấu hình mỏ neo chuẩn hóa xuất phát cho xe ~0.93kg
-    DEFAULT_SEED_PID = [55.0, 0.50, 6.0]
+    # Cấu hình mỏ neo chuẩn hóa xuất phát tối ưu cho xe ~0.93kg (Đứng vững ngay từ Mẫu 1)
+    DEFAULT_SEED_PID = [60.0, 0.45, 7.0]
 
     # Giới hạn an toàn vật lý của xe (Ngăn không cho vọt lên 85 gây rung giật ngã)
     KP_MIN, KP_MAX = 42.0, 72.0
