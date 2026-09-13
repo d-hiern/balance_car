@@ -349,13 +349,25 @@ class PsoPIDTunerNode(Node):
             return
 
         # ============================================================
-        # 1. STATE: RESET (Dựng xe và giữ vững ngay lập tức)
+        # 1. STATE: RESET (Dựng xe và chờ Gazebo reset ổn định)
         # ============================================================
         if self.state == self.STATE_RESET:
             out = 58.0 * (pitch - 0.0) + 6.5 * gyro_y
             self.publish_cmd_vel(out)
-            if elapsed > 0.8:
+
+            # Chờ ít nhất 2.0s cho Gazebo reset hoàn tất
+            if elapsed < 2.0:
+                return
+
+            # Kiểm tra robot ĐÃ THỰC SỰ ĐỨNG chưa (< 10°)
+            if abs(pitch) < 0.175:
+                # Robot đứng ổn → bắt đầu thử nghiệm
                 self._start_particle_trial(timestamp)
+            elif elapsed > 5.0:
+                # Quá 5 giây mà robot vẫn chưa đứng → gọi lại Gazebo reset
+                self.get_logger().warn('  🔄 Robot chưa đứng dậy sau 5s! Gọi lại Gazebo Reset...')
+                self.trigger_gazebo_reset()
+                self.state_start_time = timestamp  # Reset đồng hồ
 
         # ============================================================
         # 2. STATE: STATIC (1. Kiểm định độ ổn định tĩnh & rung giật 2.5s)
