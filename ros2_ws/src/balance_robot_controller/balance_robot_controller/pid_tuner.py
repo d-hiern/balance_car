@@ -101,7 +101,7 @@ class PsoPIDTunerNode(Node):
 
     # Không gian tìm kiếm 4 chiều: [Kp, Ki, Kd, Target_Pitch]
     SEARCH_BOUNDS = [
-        (45.0, 75.0),       # Kp
+        (40.0, 85.0),       # Kp (khoảng rộng tối ưu: 40 phản xạ êm -> 85 phản xạ đanh)
         (0.2, 1.2),         # Ki (nhỏ để chống trôi)
         (4.5, 9.0),         # Kd
         (-0.008, 0.008),    # Target Pitch (rad)
@@ -111,7 +111,7 @@ class PsoPIDTunerNode(Node):
         super().__init__('pid_tuner')
 
         # ===== Parameters =====
-        self.declare_parameter('num_particles', 4)
+        self.declare_parameter('num_particles', 6)
         self.declare_parameter('max_generations', 3)
         self.declare_parameter('fall_threshold', 0.785)
         self.declare_parameter('max_velocity', 1.5)
@@ -244,6 +244,7 @@ class PsoPIDTunerNode(Node):
             # Thêm điểm làm ngã vào Blacklist để lần sau không bao giờ thử lại
             bad_pos = list(self.particles[self.current_particle_idx].position)
             self.blacklist.append(bad_pos)
+            self._save_memory()  # Lưu ngay blacklist vào ổ đĩa
             self.get_logger().warn(
                 f'  ⚠️ Cá thể #{self.current_particle_idx + 1} làm ngã xe (Pitch = {math.degrees(pitch):.1f}°)! '
                 f'Đã đưa vào Blacklist 🚫'
@@ -349,6 +350,7 @@ class PsoPIDTunerNode(Node):
             if final_pitch_deg > 4.5 and not self.robot_fell:
                 bad_pos = list(particle.position)
                 self.blacklist.append(bad_pos)
+                self._save_memory()  # Lưu ngay blacklist vào ổ đĩa
                 self.get_logger().warn(
                     f'    ⚠️ Hết giờ nhưng xe chưa hồi phục (Góc cuối = {final_pitch_deg:.1f}° > 4.5°)! Bị loại 🚫'
                 )

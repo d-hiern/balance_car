@@ -40,7 +40,7 @@ balance_controller:
 pid_tuner:
   ros__parameters:
     # --- Cấu hình Thuật toán Tối ưu Bầy đàn (PSO AI) ---
-    num_particles: 4            # Số lượng cá thể trong bầy (mỗi cá thể mang 1 bộ PID)
+    num_particles: 6            # Số lượng cá thể trong bầy (tăng lên 6 để khám phá đa dạng hơn)
     max_generations: 3          # Số thế hệ tiến hóa và hội tụ bầy đàn
 
     # --- An toàn & Giới hạn ---
