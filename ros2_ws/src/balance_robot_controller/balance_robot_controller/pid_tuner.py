@@ -91,6 +91,8 @@ class PIDTunerNode(Node):
         self.best_pid = list(self.DEFAULT_SEED_PID)
         self.best_fitness = 0.0
         self.history_records = []
+        self.blacklist = []
+        self.MAX_BLACKLIST_SIZE = 10
 
         if reset_memory:
             self._delete_memory()
@@ -164,6 +166,11 @@ class PIDTunerNode(Node):
                         )
                     else:
                         self.get_logger().warn('  ⚠️ Kỷ lục cũ không đạt chuẩn (Kp quá yếu hoặc fit thấp). Dùng bộ chuẩn mới!')
+
+                    loaded_bl = data.get('blacklist', [])
+                    self.blacklist = [b for b in loaded_bl if isinstance(b, list) and len(b) >= 3][-self.MAX_BLACKLIST_SIZE:]
+                    if self.blacklist:
+                        self.get_logger().info(f'  📋 Đã nạp {len(self.blacklist)} điểm cấm từ Blacklist cũ.')
             except Exception as e:
                 self.get_logger().warn(f'Lỗi đọc memory: {e}')
 
@@ -181,6 +188,7 @@ class PIDTunerNode(Node):
             'zn_kp': self.best_pid[0],
             'zn_ki': self.best_pid[1],
             'zn_kd': self.best_pid[2],
+            'blacklist': self.blacklist[-self.MAX_BLACKLIST_SIZE:],
         }
         try:
             with open(self.memory_file, 'w') as f:
@@ -439,6 +447,14 @@ class PIDTunerNode(Node):
         reasons = []
 
         if self.robot_fell:
+            # Ghi nhận bộ số bị ngã vào Blacklist để không bao giờ lặp lại
+            bad_entry = [round(self.current_kp, 2), round(self.current_ki, 4), round(self.current_kd, 2)]
+            if not any(abs(b[0] - bad_entry[0]) < 1.0 and abs(b[2] - bad_entry[2]) < 0.3 for b in self.blacklist):
+                self.blacklist.append(bad_entry)
+                self.blacklist = self.blacklist[-self.MAX_BLACKLIST_SIZE:]
+                self._save_memory()
+            self.get_logger().warn(f'  🚫 Đã thêm bộ số bị ngã vào Blacklist: Kp={bad_entry[0]:.2f}, Kd={bad_entry[2]:.2f}')
+
             # Nếu xe ngã -> Tăng mạnh độ cứng vững Kp và giảm chấn Kd
             delta_kp = +8.0
             delta_kd = +1.5
@@ -454,7 +470,7 @@ class PIDTunerNode(Node):
                 delta_kd -= 0.35
                 reasons.append(f"Rung chấn motor cao (Chatter={chatter:.2f}) ➔ Giảm nhẹ Kd (-0.35)")
 
-            # --- Phân tích Độ Cứng Vững Kp (Dựa vào Thời gian hồi phục Ts và Chattering) ---
+            # --- Phân tích Độ Cững Vững Kp (Dựa vào Thời gian hồi phục Ts và Chattering) ---
             if ts_sec > 0.8:
                 d_kp = min(6.0, max(2.0, 4.0 * (ts_sec - 0.6)))
                 delta_kp += d_kp
@@ -471,16 +487,35 @@ class PIDTunerNode(Node):
             elif avg_drift < 0.15 and rms_deg < 0.6:
                 reasons.append("Vị trí và độ thăng bằng rất ổn định ➔ Giữ nguyên Ki")
 
+        # 5. Cập nhật bộ thông số cho bước tiếp theo (Kẹp trong biên an toàn)
+        next_kp = max(self.KP_MIN, min(self.KP_MAX, self.current_kp + delta_kp))
+        next_ki = max(self.KI_MIN, min(self.KI_MAX, self.current_ki + delta_ki))
+        next_kd = max(self.KD_MIN, min(self.KD_MAX, self.current_kd + delta_kd))
+
+        # 5b. Kiểm tra né tránh Blacklist (Tuyệt đối không lặp lại vùng từng bị ngã)
+        for bad in self.blacklist:
+            dist = math.sqrt(
+                ((next_kp - bad[0]) / (self.KP_MAX - self.KP_MIN)) ** 2 +
+                ((next_kd - bad[2]) / (self.KD_MAX - self.KD_MIN)) ** 2
+            )
+            if dist < 0.08:  # Quá gần điểm ngã cũ
+                shift_kp = 4.0 if next_kp <= bad[0] else 2.0
+                shift_kd = 0.8 if next_kd <= bad[2] else 0.4
+                orig_kp, orig_kd = next_kp, next_kd
+                next_kp = max(self.KP_MIN, min(self.KP_MAX, next_kp + shift_kp))
+                next_kd = max(self.KD_MIN, min(self.KD_MAX, next_kd + shift_kd))
+                reasons.append(f"Gần Blacklist ({bad[0]:.1f}, {bad[2]:.1f}) ➔ Né sang Kp={next_kp:.2f}, Kd={next_kd:.2f}")
+                self.get_logger().warn(
+                    f'  🛡️ Né tránh Blacklist: Bộ số gần điểm ngã cũ ({bad[0]:.1f}, {bad[2]:.1f}) '
+                    f'➔ Dịch chuyển an toàn từ ({orig_kp:.2f}, {orig_kd:.2f}) sang ({next_kp:.2f}, {next_kd:.2f})'
+                )
+                break
+
         # In các lý do điều chỉnh
         if not reasons:
             reasons.append("Tất cả các chỉ số đều đạt mức lý tưởng!")
         for r in reasons:
             self.get_logger().info(f'  │  • {r:<57}│')
-
-        # 5. Cập nhật bộ thông số cho bước tiếp theo (Kẹp trong biên an toàn)
-        next_kp = max(self.KP_MIN, min(self.KP_MAX, self.current_kp + delta_kp))
-        next_ki = max(self.KI_MIN, min(self.KI_MAX, self.current_ki + delta_ki))
-        next_kd = max(self.KD_MIN, min(self.KD_MAX, self.current_kd + delta_kd))
 
         self.get_logger().info('  ├─────────────────────────────────────────────────────────────┤')
         self.get_logger().info(
