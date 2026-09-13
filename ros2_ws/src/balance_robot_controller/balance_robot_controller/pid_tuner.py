@@ -284,9 +284,9 @@ class PIDTunerNode(Node):
         gyro_y = msg.angular_velocity.y
         timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
-        if self.state_start_time is None or elapsed < 0:
+        if self.state_start_time is None or timestamp < self.state_start_time:
             self.state_start_time = timestamp
-            elapsed = 0.0
+        elapsed = timestamp - self.state_start_time
 
         # ============ PHA 1: RELAY FEEDBACK ============
 
