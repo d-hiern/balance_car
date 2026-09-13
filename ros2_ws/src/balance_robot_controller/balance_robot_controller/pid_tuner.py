@@ -219,17 +219,23 @@ class PIDTunerNode(Node):
                 with open(self.memory_file, 'r') as f:
                     data = json.load(f)
                     loaded_fit = data.get('global_best_fitness', 0.0)
-                    if loaded_fit >= self.MIN_TRUSTWORTHY_FITNESS:
-                        self.global_best_position = data.get('global_best_position')
+                    loaded_pos = data.get('global_best_position')
+                    # Yêu cầu Kp phải >= 38.0 để tránh nạp các bộ số nhão/trôi xe
+                    if (loaded_fit >= self.MIN_TRUSTWORTHY_FITNESS
+                            and loaded_pos and len(loaded_pos) >= 2
+                            and loaded_pos[0] >= 38.0):
+                        self.global_best_position = loaded_pos
                         self.global_best_fitness = loaded_fit
-                        self.get_logger().info(f'  ✅ Kế thừa kỷ lục: Fitness={loaded_fit:.1f}/100')
+                        self.get_logger().info(f'  ✅ Kế thừa kỷ lục: Kp={loaded_pos[0]:.2f}, Kd={loaded_pos[1]:.2f} (Fitness={loaded_fit:.1f}/100)')
                     else:
-                        self.get_logger().warn(f'  ⚠️ Kỷ lục cũ tệ ({loaded_fit:.1f}). Bắt đầu lại!')
-                    if 'zn_kp' in data:
+                        self.get_logger().warn(f'  ⚠️ Kỷ lục cũ không đạt chuẩn (Kp < 38.0 hoặc yếu). Khởi động bầy hạt chuẩn mới!')
+                        self.global_best_position = None
+                        self.global_best_fitness = 0.0
+                    if 'zn_kp' in data and data['zn_kp'] >= 38.0:
                         self.zn_kp = data['zn_kp']
-                        self.zn_ki = data['zn_ki']
-                        self.zn_kd = data['zn_kd']
-                    self.blacklist = data.get('blacklist', [])[-self.MAX_BLACKLIST_SIZE:]
+                        self.zn_ki = min(0.8, data['zn_ki'])
+                        self.zn_kd = max(4.0, data['zn_kd'])
+                    self.blacklist = [b for b in data.get('blacklist', []) if len(b) >= 2 and b[0] >= 30.0][-self.MAX_BLACKLIST_SIZE:]
             except Exception as e:
                 self.get_logger().warn(f'Lỗi đọc memory: {e}')
 
@@ -511,9 +517,10 @@ class PIDTunerNode(Node):
             return
 
         self.relay_ku = 4.0 * self.relay_amplitude / (math.pi * au)
-        self.zn_kp = max(20.0, min(120.0, 0.6 * self.relay_ku))
-        self.zn_ki = max(0.1, min(3.0, 1.2 * self.relay_ku / self.relay_tu))
-        self.zn_kd = max(1.0, min(15.0, 0.075 * self.relay_ku * self.relay_tu))
+        # Giới hạn an toàn dựa trên động lực học thực tế của xe tự cân bằng (~0.93kg)
+        self.zn_kp = max(42.0, min(80.0, 0.6 * self.relay_ku))
+        self.zn_ki = max(0.25, min(0.75, 1.2 * self.relay_ku / self.relay_tu))
+        self.zn_kd = max(4.5, min(9.0, 0.075 * self.relay_ku * self.relay_tu))
 
         self.get_logger().info('')
         self.get_logger().info('  ┌─────────────────────────────────────────────┐')
@@ -522,7 +529,7 @@ class PIDTunerNode(Node):
         self.get_logger().info(f'  │  Tu = {self.relay_tu:.4f}s  |  Au = {math.degrees(au):.4f}°          │')
         self.get_logger().info(f'  │  Ku (Critical Gain) = {self.relay_ku:.2f}               │')
         self.get_logger().info('  ├─────────────────────────────────────────────┤')
-        self.get_logger().info('  │       🎯 ZIEGLER-NICHOLS PID                │')
+        self.get_logger().info('  │       🎯 ZIEGLER-NICHOLS PID (CHUẨN HÓA)   │')
         self.get_logger().info('  ├─────────────────────────────────────────────┤')
         self.get_logger().info(f'  │  Kp = {self.zn_kp:.2f}  |  Ki = {self.zn_ki:.4f}  |  Kd = {self.zn_kd:.4f}  │')
         self.get_logger().info('  └─────────────────────────────────────────────┘')
@@ -531,11 +538,15 @@ class PIDTunerNode(Node):
     # ====================== PSO CHUYỂN PHA ======================
 
     def _transition_to_pso(self, timestamp):
-        kp_m = max(self.zn_kp * 0.3, 10.0)
-        kd_m = max(self.zn_kd * 0.3, 2.0)
+        kp_m = max(self.zn_kp * 0.25, 8.0)
+        kd_m = max(self.zn_kd * 0.25, 1.5)
+        kp_low = max(38.0, self.zn_kp - kp_m)
+        kp_high = min(82.0, self.zn_kp + kp_m)
+        kd_low = max(4.0, self.zn_kd - kd_m)
+        kd_high = min(9.5, self.zn_kd + kd_m)
         self.pso_bounds = [
-            (max(15.0, self.zn_kp - kp_m), min(130.0, self.zn_kp + kp_m)),
-            (max(1.0, self.zn_kd - kd_m), min(18.0, self.zn_kd + kd_m)),
+            (kp_low, kp_high),
+            (kd_low, kd_high),
         ]
 
         self.get_logger().info('  ═══════════════════════════════════════════')
