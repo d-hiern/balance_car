@@ -96,7 +96,7 @@ class PIDTunerNode(Node):
         self.best_metrics = None
 
         self.blacklist = []
-        self.MAX_BLACKLIST_SIZE = 12
+        self.MAX_BLACKLIST_SIZE = 80
 
         if reset_memory:
             self._delete_memory()
@@ -191,9 +191,16 @@ class PIDTunerNode(Node):
                         self.get_logger().warn('  ⚠️ Kỷ lục cũ không đạt chuẩn. Khởi động từ cấu hình mặc định!')
 
                     loaded_bl = data.get('blacklist', [])
-                    self.blacklist = [b for b in loaded_bl if isinstance(b, list) and len(b) >= 3][-self.MAX_BLACKLIST_SIZE:]
+                    self.blacklist = []
+                    for b in loaded_bl:
+                        if isinstance(b, list) and len(b) >= 2:
+                            kp = float(b[0])
+                            kd = float(b[2]) if len(b) >= 3 else float(b[1])
+                            ki = float(b[1]) if len(b) >= 3 else 0.50
+                            self.blacklist.append([round(kp, 2), round(ki, 4), round(kd, 2)])
+                    self.blacklist = self.blacklist[-self.MAX_BLACKLIST_SIZE:]
                     if self.blacklist:
-                        self.get_logger().info(f'  📋 Đã nạp {len(self.blacklist)} điểm cấm từ Blacklist cũ.')
+                        self.get_logger().info(f'  📋 Đã nạp đầy đủ {len(self.blacklist)} điểm cấm từ Blacklist cũ.')
             except Exception as e:
                 self.get_logger().warn(f'Lỗi đọc memory: {e}')
 
@@ -205,17 +212,23 @@ class PIDTunerNode(Node):
                 pass
 
     def _save_memory(self):
-        """Lưu trữ bền vững bộ số tốt nhất."""
-        if self.best_pid is None or self.best_fitness <= 0.0:
-            return
-        data = {
-            'global_best_position': [self.best_pid[0], self.best_pid[2]],
-            'global_best_fitness': self.best_fitness,
-            'zn_kp': self.best_pid[0],
-            'zn_ki': self.best_pid[1],
-            'zn_kd': self.best_pid[2],
-            'blacklist': self.blacklist[-self.MAX_BLACKLIST_SIZE:],
-        }
+        """Lưu trữ bền vững bộ số tốt nhất và toàn bộ danh sách Blacklist."""
+        data = {}
+        if os.path.exists(self.memory_file):
+            try:
+                with open(self.memory_file, 'r') as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+
+        if self.best_pid is not None and self.best_fitness > 0.0:
+            data['global_best_position'] = [self.best_pid[0], self.best_pid[2]]
+            data['global_best_fitness'] = self.best_fitness
+            data['zn_kp'] = self.best_pid[0]
+            data['zn_ki'] = self.best_pid[1]
+            data['zn_kd'] = self.best_pid[2]
+
+        data['blacklist'] = self.blacklist[-self.MAX_BLACKLIST_SIZE:]
         try:
             with open(self.memory_file, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -258,16 +271,18 @@ class PIDTunerNode(Node):
 
         # Kiểm tra né tránh Blacklist (Tuyệt đối không thử lại vùng từng ngã)
         for bad in self.blacklist:
+            bad_kp = float(bad[0])
+            bad_kd = float(bad[2]) if len(bad) >= 3 else float(bad[1])
             dist = math.sqrt(
-                ((cand_kp - bad[0]) / (self.KP_MAX - self.KP_MIN)) ** 2 +
-                ((cand_kd - bad[2]) / (self.KD_MAX - self.KD_MIN)) ** 2
+                ((cand_kp - bad_kp) / (self.KP_MAX - self.KP_MIN)) ** 2 +
+                ((cand_kd - bad_kd) / (self.KD_MAX - self.KD_MIN)) ** 2
             )
             if dist < 0.08:
-                shift_kp = 3.0 if cand_kp <= bad[0] else -2.5
-                shift_kd = 0.6 if cand_kd <= bad[2] else -0.5
+                shift_kp = 3.0 if cand_kp <= bad_kp else -2.5
+                shift_kd = 0.6 if cand_kd <= bad_kd else -0.5
                 cand_kp = max(self.KP_MIN, min(self.KP_MAX, cand_kp + shift_kp))
                 cand_kd = max(self.KD_MIN, min(self.KD_MAX, cand_kd + shift_kd))
-                desc += f" [🛡️ Đã né Blacklist ({bad[0]:.1f}, {bad[2]:.1f})]"
+                desc += f" [🛡️ Đã né Blacklist ({bad_kp:.1f}, {bad_kd:.1f})]"
                 break
 
         return cand_kp, cand_ki, cand_kd, desc
