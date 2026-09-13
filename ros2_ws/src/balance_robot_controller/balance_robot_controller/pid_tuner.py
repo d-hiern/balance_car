@@ -90,6 +90,7 @@ class PIDTunerNode(Node):
 
         self.best_pid = list(self.DEFAULT_SEED_PID)
         self.best_fitness = 0.0
+        self.best_metrics = None
         self.history_records = []
         self.blacklist = []
         self.MAX_BLACKLIST_SIZE = 10
@@ -422,6 +423,13 @@ class PIDTunerNode(Node):
         if fitness > self.best_fitness:
             self.best_fitness = fitness
             self.best_pid = [self.current_kp, self.current_ki, self.current_kd]
+            self.best_metrics = {
+                'mp': mp_deg,
+                'ts': ts_sec,
+                'rms': rms_deg,
+                'drift': avg_drift,
+                'chatter': chatter
+            }
             self._save_memory()
 
         # 3. In bảng "Bệnh án" dao động của xe
@@ -433,14 +441,19 @@ class PIDTunerNode(Node):
         if not self.robot_fell:
             self.get_logger().info(f'  │  Đáp ứng:   Mp={mp_deg:<5.1f}°  Ts={ts_sec:<5.2f}s  Drift={avg_drift:<5.2f}m/s           │')
             self.get_logger().info(f'  │             RMS={rms_deg:<4.2f}°  Chatter={chatter:<4.2f}  Nhịp lắc={total_ringing:<2d}         │')
-            self.get_logger().info(f'  │  Điểm:      {fitness:.1f} / 100  (Kỷ lục: {self.best_fitness:.1f}/100)               │')
+            self.get_logger().info(f'  │  Đạt chuẩn: {fitness:>5.1f}% tối ưu  (Kỷ lục: {self.best_fitness:>5.1f}%)                 │')
         else:
             self.get_logger().info(f'  │  Trạng thái: ❌ ROBOT BỊ NGÃ: {self.fall_reason:<28}│')
-            self.get_logger().info('  │  Điểm:      0.0 / 100                                       │')
+            self.get_logger().info('  │  Đạt chuẩn:   0.0% tối ưu                                   │')
         self.get_logger().info('  ├─────────────────────────────────────────────────────────────┤')
         self.get_logger().info('  │ 🧠 PHÂN TÍCH VẬT LÝ & ĐIỀU CHỈNH TỰ THÍCH NGHI:             │')
 
-        # 4. Thuật toán phân tích giải tích để tính lượng thay đổi ΔKp, ΔKi, ΔKd
+        # Tính toán tỷ lệ thời gian đứng vững (Survival ratio)
+        standing_time = (timestamp - self.trial_start_time) if self.trial_start_time else 0.0
+        total_test_time = self.balance_duration + 0.1 + self.recovery_duration + 0.1 + self.recovery_duration
+        survival_ratio = min(1.0, max(0.0, standing_time / total_test_time))
+
+        # 4. Thuật toán phân tích giải tích tính ΔKp, ΔKi, ΔKd dựa trên ĐIỂM THÍCH NGHI & ĐỘ THIẾU HỤT
         delta_kp = 0.0
         delta_ki = 0.0
         delta_kd = 0.0
@@ -455,37 +468,63 @@ class PIDTunerNode(Node):
                 self._save_memory()
             self.get_logger().warn(f'  🚫 Đã thêm bộ số bị ngã vào Blacklist: Kp={bad_entry[0]:.2f}, Kd={bad_entry[2]:.2f}')
 
-            # Nếu xe ngã -> Tăng mạnh độ cứng vững Kp và giảm chấn Kd
-            delta_kp = +8.0
-            delta_kd = +1.5
-            delta_ki = -0.10
-            reasons.append("Xe bị ngã ➔ Tăng mạnh lực đàn hồi Kp (+8.0) và giảm chấn Kd (+1.5)")
+            # TÍNH TOÁN ĐỘ THIẾU HỤT DỰA TRÊN TỶ LỆ THỜI GIAN ĐỨNG VỮNG (SURVIVAL RATIO)
+            deficit = 1.0 - survival_ratio  # deficit = 1.0 nếu ngã ngay lập tức, deficit = 0.2 nếu ngã ở giây cuối
+            delta_kp = 14.0 * deficit + 2.5
+            delta_kd = 2.2 * deficit + 0.5
+            delta_ki = -0.15 * deficit
+            reasons.append(
+                f"Ngã tại t={standing_time:.1f}s (đạt {survival_ratio*100:.0f}% bài thi) ➔ "
+                f"Bù thiếu hụt: ΔKp=+{delta_kp:.2f}, ΔKd=+{delta_kd:.2f}"
+            )
         else:
-            # --- Phân tích Giảm Chấn Kd (Dựa vào Độ vọt lố Mp và Số nhịp rung lắc) ---
-            if mp_deg > 6.0 or total_ringing >= 3:
-                d_kd = min(1.2, max(0.4, 0.12 * (mp_deg - 5.0)))
+            # TÍNH TOÁN THEO HÀM ĐIỂM THÍCH NGHI (FITNESS GAP)
+            # Điểm càng thấp -> Độ lệch càng lớn -> Lượng bù càng lớn
+            # Điểm càng cao (ví dụ > 85) -> Bước tinh chỉnh càng nhỏ và mịn
+            fitness_gap = max(0.05, (100.0 - fitness) / 100.0)
+
+            # --- Phân tích Giảm Chấn Kd (Dựa trên Độ vọt lố Mp & Tỷ lệ điểm trừ) ---
+            target_mp = 4.5  # Ngưỡng vọt lố lý tưởng <= 4.5 độ
+            if mp_deg > target_mp or total_ringing >= 2:
+                mp_err = (mp_deg - target_mp) / 5.0
+                d_kd = 1.8 * fitness_gap * max(0.3, mp_err) + (0.3 if total_ringing >= 3 else 0.0)
+                d_kd = min(1.5, max(0.2, d_kd))
                 delta_kd += d_kd
-                reasons.append(f"Vọt lố ngửa người lớn (Mp={mp_deg:.1f}° > 6°) ➔ Tăng Kd (+{d_kd:.2f}) dập tắt lắc")
-            elif mp_deg <= 4.0 and chatter > 0.08:
-                delta_kd -= 0.35
-                reasons.append(f"Rung chấn motor cao (Chatter={chatter:.2f}) ➔ Giảm nhẹ Kd (-0.35)")
+                reasons.append(f"Vọt lố Mp={mp_deg:.1f}° (Gap={fitness_gap*100:.0f}%) ➔ Bù giảm chấn: ΔKd=+{d_kd:.2f}")
+            elif mp_deg <= 3.5 and chatter > 0.06:
+                d_kd = 0.6 * fitness_gap * ((chatter - 0.05) / 0.08)
+                d_kd = min(0.45, max(0.15, d_kd))
+                delta_kd -= d_kd
+                reasons.append(f"Rung chấn motor (Chatter={chatter:.2f}) ➔ Giảm nhẹ Kd: ΔKd=-{d_kd:.2f}")
 
-            # --- Phân tích Độ Cững Vững Kp (Dựa vào Thời gian hồi phục Ts và Chattering) ---
-            if ts_sec > 0.8:
-                d_kp = min(6.0, max(2.0, 4.0 * (ts_sec - 0.6)))
+            # --- Phân tích Độ Cứng Vững Kp (Dựa trên Thời gian hồi phục Ts & Điểm thích nghi) ---
+            target_ts = 0.55  # Thời gian hồi phục lý tưởng <= 0.55s
+            if ts_sec > target_ts:
+                ts_err = (ts_sec - target_ts) / 1.2
+                d_kp = 10.0 * fitness_gap * max(0.3, ts_err)
+                d_kp = min(7.0, max(1.5, d_kp))
                 delta_kp += d_kp
-                reasons.append(f"Hồi phục chậm (Ts={ts_sec:.2f}s > 0.8s) ➔ Tăng Kp (+{d_kp:.2f}) để tăng độ cứng")
-            elif chatter > 0.12:
-                delta_kp -= 3.5
-                reasons.append(f"Dao động tần số cao căng cứng ➔ Giảm Kp (-3.5)")
+                reasons.append(f"Hồi phục chậm Ts={ts_sec:.2f}s (Gap={fitness_gap*100:.0f}%) ➔ Tăng độ cứng: ΔKp=+{d_kp:.2f}")
+            elif chatter > 0.10:
+                d_kp = 6.0 * fitness_gap * ((chatter - 0.08) / 0.12)
+                d_kp = min(4.5, max(1.5, d_kp))
+                delta_kp -= d_kp
+                reasons.append(f"Căng cứng rung cao tần (Chatter={chatter:.2f}) ➔ Hạ Kp: ΔKp=-{d_kp:.2f}")
 
-            # --- Phân tích Tích Phân Ki (Dựa vào Tốc độ trôi xe Drift) ---
-            if avg_drift > 0.40:
-                d_ki = min(0.15, max(0.05, (avg_drift - 0.3) * 0.25))
+            # --- Phân tích Tích Phân Ki (Dựa trên Tốc độ trôi xe Drift & Sai số tĩnh) ---
+            target_drift = 0.20  # Tốc độ trôi cho phép <= 0.20 m/s
+            if avg_drift > target_drift:
+                drift_err = (avg_drift - target_drift) / 0.8
+                d_ki = 0.22 * fitness_gap * max(0.3, drift_err)
+                d_ki = min(0.18, max(0.04, d_ki))
                 delta_ki -= d_ki
-                reasons.append(f"Xe bị trôi bánh (Drift={avg_drift:.2f}m/s) ➔ Giảm Ki (-{d_ki:.3f}) khử trôi")
+                reasons.append(f"Trôi xe Drift={avg_drift:.2f}m/s ➔ Giảm tích phân: ΔKi=-{d_ki:.3f}")
+            elif avg_drift < 0.12 and rms_deg > 1.0:
+                d_ki = 0.08 * fitness_gap
+                delta_ki += d_ki
+                reasons.append(f"Khử lệch tĩnh (RMS={rms_deg:.2f}°) ➔ Bổ sung Ki: ΔKi=+{d_ki:.3f}")
             elif avg_drift < 0.15 and rms_deg < 0.6:
-                reasons.append("Vị trí và độ thăng bằng rất ổn định ➔ Giữ nguyên Ki")
+                reasons.append("Vị trí và độ thăng bằng đạt chuẩn ➔ Giữ nguyên Ki")
 
         # 5. Cập nhật bộ thông số cho bước tiếp theo (Kẹp trong biên an toàn)
         next_kp = max(self.KP_MIN, min(self.KP_MAX, self.current_kp + delta_kp))
@@ -558,25 +597,57 @@ class PIDTunerNode(Node):
         kp, ki, kd = self.best_pid[0], self.best_pid[1], self.best_pid[2]
         self._save_memory()
 
-        self.get_logger().info('')
-        self.get_logger().info('=' * 70)
-        self.get_logger().info('     🏆 QUÁ TRÌNH TỐI ƯU HÓA HOÀN TẤT (HỘI TỤ THÀNH CÔNG) 🏆')
-        self.get_logger().info('=' * 70)
-        self.get_logger().info(f'  Điểm Fitness tối ưu: {self.best_fitness:.1f} / 100')
-        self.get_logger().info('')
-        self.get_logger().info('  ┌──────────────────────────────────────────┐')
-        self.get_logger().info(f'  │  Kp = {kp:>10.4f} (Độ cứng vững)        │')
-        self.get_logger().info(f'  │  Ki = {ki:>10.4f} (Khử sai số tĩnh)     │')
-        self.get_logger().info(f'  │  Kd = {kd:>10.4f} (Giảm chấn gyro)      │')
-        self.get_logger().info('  └──────────────────────────────────────────┘')
-        self.get_logger().info('  ✓ Bộ nhớ đã cập nhật ➔ ~/.pso_pid_memory.json')
-        self.get_logger().info('=' * 70)
-        self._save_yaml(kp, ki, kd)
+        opt_percent = self.best_fitness
 
-    def _save_yaml(self, kp, ki, kd):
+        if opt_percent >= 90.0:
+            rating = "⭐⭐⭐⭐⭐ XUẤT SẮC (Gần như hoàn hảo)"
+        elif opt_percent >= 80.0:
+            rating = "⭐⭐⭐⭐ RẤT TỐT (Chuẩn công nghiệp - Vận hành thực tế)"
+        elif opt_percent >= 70.0:
+            rating = "⭐⭐⭐ TỐT (Thăng bằng ổn định, chống nhiễu khá)"
+        elif opt_percent >= 50.0:
+            rating = "⭐⭐ TRUNG BÌNH (Cân bằng được, còn dao động nhẹ)"
+        else:
+            rating = "⭐ YẾU (Cần tinh chỉnh lại)"
+
+        # Điểm thành phần từng tiêu chuẩn kỹ thuật
+        if self.best_metrics:
+            score_rms = max(0.0, min(100.0, (1.0 - self.best_metrics['rms'] / 2.5) * 100))
+            score_mp = max(0.0, min(100.0, (1.0 - self.best_metrics['mp'] / 12.0) * 100))
+            score_ts = max(0.0, min(100.0, (1.0 - self.best_metrics['ts'] / 1.5) * 100))
+            score_drift = max(0.0, min(100.0, (1.0 - self.best_metrics['drift'] / 0.8) * 100))
+        else:
+            score_rms, score_mp, score_ts, score_drift = opt_percent, opt_percent, opt_percent, opt_percent
+
+        self.get_logger().info('')
+        self.get_logger().info('=' * 72)
+        self.get_logger().info('     🏆 QUÁ TRÌNH TỐI ƯU HÓA HOÀN TẤT (HỘI TỤ THÀNH CÔNG) 🏆')
+        self.get_logger().info('=' * 72)
+        self.get_logger().info(f'  🎯 MỨC ĐỘ TỐI ƯU HÓA ĐẠT ĐƯỢC: {opt_percent:.1f}%')
+        self.get_logger().info(f'  ⭐ Đánh giá tổng thể: {rating}')
+        self.get_logger().info('')
+        self.get_logger().info('  ┌────────────────────────────────────────────────────────────┐')
+        self.get_logger().info('  │ 📊 BẢNG ĐIỂM CHI TIẾT TỪNG TIÊU CHÍ KỸ THUẬT:              │')
+        self.get_logger().info('  ├────────────────────────────────────────────────────────────┤')
+        self.get_logger().info(f'  │  • Độ êm ái thăng bằng tĩnh:       {score_rms:>6.1f}%                   │')
+        self.get_logger().info(f'  │  • Khả năng dập tắt vọt lố (Mp):   {score_mp:>6.1f}%                   │')
+        self.get_logger().info(f'  │  • Tốc độ hồi phục sau huých (Ts): {score_ts:>6.1f}%                   │')
+        self.get_logger().info(f'  │  • Khả năng giữ vị trí chống trôi: {score_drift:>6.1f}%                   │')
+        self.get_logger().info('  ├────────────────────────────────────────────────────────────┤')
+        self.get_logger().info('  │ 🎯 BỘ THAM SỐ PID TỐI ƯU CUỐI CÙNG:                        │')
+        self.get_logger().info('  ├────────────────────────────────────────────────────────────┤')
+        self.get_logger().info(f'  │  Kp = {kp:>10.4f}  (Độ cứng vững đàn hồi)               │')
+        self.get_logger().info(f'  │  Ki = {ki:>10.4f}  (Triệt tiêu sai số xác lập)          │')
+        self.get_logger().info(f'  │  Kd = {kd:>10.4f}  (Giảm chấn dập rung gyro)            │')
+        self.get_logger().info('  └────────────────────────────────────────────────────────────┘')
+        self.get_logger().info('  ✓ Bộ nhớ đã cập nhật ➔ ~/.pso_pid_memory.json')
+        self.get_logger().info('=' * 72)
+        self._save_yaml(kp, ki, kd, opt_percent, rating)
+
+    def _save_yaml(self, kp, ki, kd, opt_percent, rating):
         content = f"""# =============================================
 # Kết quả tinh chỉnh PID thích nghi theo dao động
-# Fitness: {self.best_fitness:.1f}/100
+# Mức độ tối ưu hóa: {opt_percent:.1f}% ({rating})
 # =============================================
 
 balance_controller:
@@ -601,7 +672,7 @@ balance_controller:
         try:
             with open(self.output_file, 'w') as f:
                 f.write(content)
-            self.get_logger().info(f'  📁 Đã lưu cấu hình tối ưu: {self.output_file}')
+            self.get_logger().info(f'  📁 Đã lưu cấu hình tối ưu ({opt_percent:.1f}%): {self.output_file}')
         except Exception as e:
             self.get_logger().warn(f'Lỗi lưu yaml: {e}')
 
