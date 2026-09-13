@@ -32,6 +32,12 @@ balance_controller:
     fall_threshold: 0.785         # Ngưỡng ngã (~45°). Dừng motor khi vượt qua
     enabled: true                 # Bật/tắt controller
 
+    # --- Vòng điều khiển Vận tốc & Vị trí (Chống trôi xe - Cascaded Loop) ---
+    enable_velocity_control: true # Bật tự động phanh chống trôi
+    kp_velocity: 0.12             # Hệ số phanh vận tốc (ngửa xe ngược chiều di chuyển)
+    kp_position: 0.04             # Hệ số kéo xe trở lại vị trí gốc
+    max_pitch_adjustment: 0.087   # Giới hạn góc ngửa tối đa (~5 độ) để đảm bảo an toàn
+
 
 # =============================================
 # Cấu hình PID Auto-Tuner

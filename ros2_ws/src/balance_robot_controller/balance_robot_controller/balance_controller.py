@@ -28,6 +28,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Imu
+from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Float64, Float64MultiArray, MultiArrayDimension, String
 
@@ -77,6 +78,12 @@ class BalanceControllerNode(Node):
         self.declare_parameter('fall_threshold', 0.785)  # ~45 degrees
         self.declare_parameter('enabled', True)
 
+        # --- Vòng điều khiển Vận tốc & Vị trí (Cascaded Loop - Chống trôi xe) ---
+        self.declare_parameter('enable_velocity_control', True)
+        self.declare_parameter('kp_velocity', 0.12)
+        self.declare_parameter('kp_position', 0.04)
+        self.declare_parameter('max_pitch_adjustment', 0.087)  # ~5.0 độ
+
         # ===== Lấy giá trị ban đầu =====
         kp = self.get_parameter('kp').value
         ki = self.get_parameter('ki').value
@@ -100,6 +107,15 @@ class BalanceControllerNode(Node):
         self.fallen = False
         self.msg_count = 0
 
+        # Tham số & biến trạng thái vòng chống trôi
+        self.enable_velocity_control = self.get_parameter('enable_velocity_control').value
+        self.kp_velocity = self.get_parameter('kp_velocity').value
+        self.kp_position = self.get_parameter('kp_position').value
+        self.max_pitch_adjustment = self.get_parameter('max_pitch_adjustment').value
+        self.current_vel_x = 0.0
+        self.current_pos_x = 0.0
+        self.target_pos_x = None
+
         # ===== Callback cập nhật parameter runtime =====
         self.add_on_set_parameters_callback(self.parameter_callback)
 
@@ -107,9 +123,13 @@ class BalanceControllerNode(Node):
         self.imu_sub = self.create_subscription(
             Imu, 'imu/data', self.imu_callback, qos_profile_sensor_data
         )
+        self.odom_sub = self.create_subscription(
+            Odometry, 'odom', self.odom_callback, qos_profile_sensor_data
+        )
 
         # ===== Publishers =====
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.target_pitch_pub = self.create_publisher(Float64, 'balance/target_pitch', 10)
         self.diag_pub = self.create_publisher(
             Float64MultiArray, 'balance/diagnostics', 10
         )
@@ -173,11 +193,24 @@ class BalanceControllerNode(Node):
                 self.use_gyro = value
             elif name == 'fall_threshold':
                 self.fall_threshold = value
+            elif name == 'enable_velocity_control':
+                self.enable_velocity_control = value
+                self.get_logger().info(f'>> Enable velocity control = {value}')
+            elif name == 'kp_velocity':
+                self.kp_velocity = value
+                self.get_logger().info(f'>> Kp velocity = {value}')
+            elif name == 'kp_position':
+                self.kp_position = value
+                self.get_logger().info(f'>> Kp position = {value}')
+            elif name == 'max_pitch_adjustment':
+                self.max_pitch_adjustment = value
+                self.get_logger().info(f'>> Max pitch adjustment = {value} rad')
             elif name == 'enabled':
                 self.enabled = value
                 if value:
                     self.pid.reset()
                     self.fallen = False
+                    self.target_pos_x = self.current_pos_x
                     self.publish_status('RUNNING')
                     self.get_logger().info('Controller ENABLED')
                 else:
@@ -186,6 +219,13 @@ class BalanceControllerNode(Node):
                     self.get_logger().info('Controller DISABLED')
 
         return SetParametersResult(successful=True)
+
+    def odom_callback(self, msg):
+        """Callback cập nhật vận tốc và vị trí xe từ Odometry."""
+        self.current_vel_x = msg.twist.twist.linear.x
+        self.current_pos_x = msg.pose.pose.position.x
+        if self.target_pos_x is None:
+            self.target_pos_x = self.current_pos_x
 
     def imu_callback(self, msg):
         """
@@ -208,6 +248,7 @@ class BalanceControllerNode(Node):
         if abs(pitch) > self.fall_threshold:
             if not self.fallen:
                 self.fallen = True
+                self.target_pos_x = None  # Reset lại vị trí mục tiêu khi ngã
                 self.get_logger().warn(
                     f'ROBOT ĐÃ NGÃ! Pitch = {math.degrees(pitch):.1f}°. '
                     f'Dừng động cơ. Đặt enabled=false rồi true để reset.'
@@ -221,11 +262,26 @@ class BalanceControllerNode(Node):
                 # Robot được dựng lại
                 self.fallen = False
                 self.pid.reset()
+                self.target_pos_x = self.current_pos_x  # Đặt điểm đứng mới làm gốc
                 self.get_logger().info('Robot đã dựng lại. Tiếp tục cân bằng.')
                 self.publish_status('RUNNING')
 
+        # ===== Vòng lặp kép Cascaded PID (Chống trôi xe & Tự động hãm phanh) =====
+        if self.enable_velocity_control and self.target_pos_x is not None:
+            vel_error = self.current_vel_x
+            pos_error = self.current_pos_x - self.target_pos_x
+            # Khi xe trôi tới (v > 0) -> bù góc âm (ngửa người ra sau) để hãm phanh
+            pitch_adjust = - (self.kp_velocity * vel_error + self.kp_position * pos_error)
+            # Kẹp góc bù an toàn (tối đa ±5 độ) để tuyệt đối không làm ngã xe
+            pitch_adjust = max(-self.max_pitch_adjustment, min(self.max_pitch_adjustment, pitch_adjust))
+        else:
+            pitch_adjust = 0.0
+
+        effective_target_pitch = self.target_pitch + pitch_adjust
+        self.target_pitch_pub.publish(Float64(data=effective_target_pitch))
+
         # ===== Tính sai số (pitch > target => xe tiến để đón trọng tâm) =====
-        error = pitch - self.target_pitch
+        error = pitch - effective_target_pitch
 
         # ===== Lấy timestamp =====
         timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
