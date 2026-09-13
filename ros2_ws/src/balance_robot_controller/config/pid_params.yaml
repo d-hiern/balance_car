@@ -21,7 +21,7 @@ balance_controller:
     target_pitch: 0.0     # Góc pitch mục tiêu (rad). 0 = đứng thẳng
 
     # --- Giới hạn ---
-    max_velocity: 1.5     # Vận tốc tối đa (m/s)
+    max_velocity: 2.5     # Vận tốc tối đa (m/s) - tăng lên 2.5 để bánh xe đủ trớn cứu xe khi nghiêng
     integral_max: 10.0    # Giới hạn anti-windup cho tích phân
 
     # --- Bộ lọc ---
@@ -50,7 +50,7 @@ pid_tuner:
   ros__parameters:
     # --- An toàn & Giới hạn ---
     fall_threshold: 0.785       # Ngưỡng ngã (rad, ~45°)
-    max_velocity: 1.5           # Vận tốc tối đa (m/s)
+    max_velocity: 2.5           # Vận tốc tối đa (m/s) - tăng lên 2.5 để bánh xe đủ trớn cứu xe
     disturb_magnitude: 0.12     # Lực huých thử động lực học (m/s)
 
     # --- Thời gian mỗi bài thử nghiệm (giây) ---

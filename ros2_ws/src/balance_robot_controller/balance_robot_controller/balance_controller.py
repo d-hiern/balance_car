@@ -71,7 +71,7 @@ class BalanceControllerNode(Node):
         self.declare_parameter('ki', 0.5)
         self.declare_parameter('kd', 5.0)
         self.declare_parameter('target_pitch', 0.0)
-        self.declare_parameter('max_velocity', 1.5)
+        self.declare_parameter('max_velocity', 2.5)
         self.declare_parameter('integral_max', 10.0)
         self.declare_parameter('derivative_filter_alpha', 0.1)
         self.declare_parameter('use_gyro_derivative', True)

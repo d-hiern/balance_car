@@ -69,7 +69,7 @@ class PIDTunerNode(Node):
 
         # ===== Khai báo Parameters =====
         self.declare_parameter('fall_threshold', 0.785)
-        self.declare_parameter('max_velocity', 1.5)
+        self.declare_parameter('max_velocity', 2.5)
         self.declare_parameter('disturb_magnitude', 0.12)
         self.declare_parameter('balance_duration', 3.5)
         self.declare_parameter('recovery_duration', 3.5)
