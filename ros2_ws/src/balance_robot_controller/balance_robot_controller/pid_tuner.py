@@ -110,6 +110,13 @@ class PsoPIDTunerNode(Node):
         (-0.008, 0.008),    # Target Pitch (rad)
     ]
 
+    # Bộ PID an toàn mặc định (đã biết giữ xe đứng trong Gazebo)
+    SAFE_DEFAULT_PID = [58.0, 0.75, 6.5, 0.0]
+    # Ngưỡng fitness tối thiểu để coi là "đáng tin cậy" kế thừa
+    MIN_TRUSTWORTHY_FITNESS = 15.0
+    # Số điểm blacklist tối đa (tránh phình to gây vòng lặp chết)
+    MAX_BLACKLIST_SIZE = 10
+
     def __init__(self):
         super().__init__('pid_tuner')
 
@@ -122,6 +129,7 @@ class PsoPIDTunerNode(Node):
         self.declare_parameter('recovery_duration', 4.5)    # Thời gian thử sau huých (tăng lên 4.5s)
         self.declare_parameter('memory_file', '~/.pso_pid_memory.json')
         self.declare_parameter('output_file', '~/tuned_pid_params.yaml')
+        self.declare_parameter('reset_memory', False)       # Đặt True để xóa sạch bộ nhớ, bắt đầu lại từ đầu
 
         self.num_particles = self.get_parameter('num_particles').value
         self.max_generations = self.get_parameter('max_generations').value
@@ -131,22 +139,30 @@ class PsoPIDTunerNode(Node):
         self.recovery_duration = self.get_parameter('recovery_duration').value
         self.memory_file = os.path.expanduser(self.get_parameter('memory_file').value)
         self.output_file = os.path.expanduser(self.get_parameter('output_file').value)
+        reset_memory = self.get_parameter('reset_memory').value
 
         # Khởi tạo hoặc nạp bộ nhớ AI từ file
         self.blacklist = []
         self.history_records = []
-        self.global_best_position = [58.0, 0.75, 6.5, 0.0]
+        self.global_best_position = list(self.SAFE_DEFAULT_PID)
         self.global_best_fitness = 0.0
 
-        self._load_memory()
+        if reset_memory:
+            # Người dùng yêu cầu xóa sạch bộ nhớ cũ
+            self._delete_memory()
+            self.get_logger().warn('🗑️  ĐÃ XÓA SẠCH BỘ NHỚ HỌC CŨ (reset_memory=True). Bắt đầu từ đầu!')
+        else:
+            self._load_memory()
 
         # Khởi tạo bầy đàn
         self.particles = []
         # Hạt #1 luôn là Hạt giống Kỷ lục Tốt nhất (Seed Champion)
         self.particles.append(Particle(self.SEARCH_BOUNDS, initial_pos=self.global_best_position))
+        # Hạt #2 luôn là Hạt An toàn Mặc định (Safety Net - tránh mất gốc)
+        self.particles.append(Particle(self.SEARCH_BOUNDS, initial_pos=self.SAFE_DEFAULT_PID))
 
         # Các hạt còn lại phân bố tìm kiếm xung quanh
-        for _ in range(1, self.num_particles):
+        for _ in range(2, self.num_particles):
             p = Particle(self.SEARCH_BOUNDS)
             # Khởi tạo né tránh blacklist ngay từ đầu
             p.update(self.global_best_position, self.blacklist)
@@ -195,24 +211,72 @@ class PsoPIDTunerNode(Node):
         self.get_logger().info('')
 
     def _load_memory(self):
-        """Nạp dữ liệu học từ file nếu đã từng chạy trước đây."""
+        """Nạp dữ liệu học từ file, tự động khử nhiễm nếu bộ nhớ bị hỏng."""
         if os.path.exists(self.memory_file):
             try:
                 with open(self.memory_file, 'r') as f:
                     data = json.load(f)
                     if 'global_best_position' in data:
-                        self.global_best_position = data['global_best_position']
-                        self.global_best_fitness = data.get('global_best_fitness', 0.0)
-                    self.blacklist = data.get('blacklist', [])
+                        loaded_pos = data['global_best_position']
+                        loaded_fit = data.get('global_best_fitness', 0.0)
+
+                        # ===== KHỬ NHIỄM: Nếu best cũ quá tệ → bỏ, dùng mặc định an toàn =====
+                        if loaded_fit >= self.MIN_TRUSTWORTHY_FITNESS:
+                            self.global_best_position = loaded_pos
+                            self.global_best_fitness = loaded_fit
+                            self.get_logger().info(
+                                f'  ✅ Kế thừa kỷ lục cũ đáng tin cậy: Fitness={loaded_fit:.1f}/100'
+                            )
+                        else:
+                            self.get_logger().warn(
+                                f'  ⚠️ Kỷ lục cũ quá tệ (Fitness={loaded_fit:.1f} < {self.MIN_TRUSTWORTHY_FITNESS}). '
+                                f'ĐÃ BỎ QUA, dùng PID an toàn mặc định [Kp=58, Kd=6.5]!'
+                            )
+                            # Giữ nguyên SAFE_DEFAULT_PID, không load cái cũ
+
+                    # Blacklist: chỉ giữ tối đa MAX_BLACKLIST_SIZE điểm và loại trùng lặp
+                    raw_blacklist = data.get('blacklist', [])
+                    self.blacklist = self._deduplicate_blacklist(raw_blacklist)
             except Exception as e:
                 self.get_logger().warn(f'Không thể đọc file memory: {e}')
 
+    def _deduplicate_blacklist(self, blacklist):
+        """Loại bỏ các điểm blacklist quá gần nhau (trùng lặp) và giới hạn kích thước."""
+        if not blacklist:
+            return []
+        cleaned = []
+        for point in blacklist:
+            is_duplicate = False
+            for existing in cleaned:
+                # Khoảng cách chuẩn hóa giữa 2 điểm
+                dist_sq = sum(
+                    ((point[k] - existing[k]) / (self.SEARCH_BOUNDS[k][1] - self.SEARCH_BOUNDS[k][0])) ** 2
+                    for k in range(len(point))
+                )
+                if dist_sq < 0.01:  # Quá gần nhau → coi như trùng
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                cleaned.append(point)
+        # Chỉ giữ N điểm gần nhất (mới nhất)
+        return cleaned[-self.MAX_BLACKLIST_SIZE:]
+
+    def _delete_memory(self):
+        """Xóa sạch file bộ nhớ để bắt đầu lại từ đầu."""
+        if os.path.exists(self.memory_file):
+            try:
+                os.remove(self.memory_file)
+            except Exception as e:
+                self.get_logger().warn(f'Không thể xóa file memory: {e}')
+
     def _save_memory(self):
         """Lưu lại trí nhớ học được vào ổ đĩa."""
+        # Loại trùng và giới hạn kích thước trước khi lưu
+        self.blacklist = self._deduplicate_blacklist(self.blacklist)
         data = {
             'global_best_position': self.global_best_position,
             'global_best_fitness': self.global_best_fitness,
-            'blacklist': self.blacklist[-20:],  # Lưu 20 điểm xấu gần nhất
+            'blacklist': self.blacklist,
         }
         try:
             with open(self.memory_file, 'w') as f:
@@ -234,15 +298,35 @@ class PsoPIDTunerNode(Node):
         twist.linear.x = max(-self.max_velocity, min(self.max_velocity, linear_x))
         self.cmd_vel_pub.publish(twist)
 
+    def _add_to_blacklist(self, reason):
+        """Thêm cá thể hiện tại vào blacklist (có giới hạn kích thước)."""
+        bad_pos = list(self.particles[self.current_particle_idx].position)
+        self.blacklist.append(bad_pos)
+        # Tự động cắt bớt nếu quá lớn
+        self.blacklist = self._deduplicate_blacklist(self.blacklist)
+        self._save_memory()
+        self.get_logger().warn(
+            f'  ⚠️ Cá thể #{self.current_particle_idx + 1}: {reason} → Blacklist 🚫 '
+            f'(Tổng: {len(self.blacklist)}/{self.MAX_BLACKLIST_SIZE} điểm)'
+        )
+
+    def _handle_seed_champion_failure(self):
+        """
+        Khi Hạt #1 (Seed Champion kế thừa từ bộ nhớ) bị ngã, có nghĩa bộ nhớ cũ
+        đã bị nhiễm độc. Reset global_best về PID an toàn mặc định để cứu cả bầy đàn.
+        """
+        if self.current_particle_idx == 0 and self.global_best_fitness < self.MIN_TRUSTWORTHY_FITNESS:
+            self.global_best_position = list(self.SAFE_DEFAULT_PID)
+            self.global_best_fitness = 0.0
+            self.get_logger().warn(
+                '  🔄 Seed Champion thất bại! Reset global_best về PID an toàn mặc định [Kp=58, Kd=6.5].'
+            )
+
     def _handle_runaway_fail(self, timestamp):
         """Xử lý loại cá thể khi trôi bạt mạng kịch trần."""
         self.robot_fell = True
-        bad_pos = list(self.particles[self.current_particle_idx].position)
-        self.blacklist.append(bad_pos)
-        self._save_memory()
-        self.get_logger().warn(
-            f'  ⚠️ Cá thể #{self.current_particle_idx + 1} bị TRÔI MẤT KIỂM SOÁT kịch trần (>= 1.5 m/s)! Đã đưa vào Blacklist 🚫'
-        )
+        self._add_to_blacklist('TRÔI MẤT KIỂM SOÁT (>= 1.5 m/s)')
+        self._handle_seed_champion_failure()
         self._evaluate_and_next_particle(timestamp)
 
     def imu_callback(self, msg):
@@ -259,14 +343,8 @@ class PsoPIDTunerNode(Node):
         # Phát hiện ngã
         if abs(pitch) > self.fall_threshold and self.state not in [self.STATE_RESET, self.STATE_DONE]:
             self.robot_fell = True
-            # Thêm điểm làm ngã vào Blacklist để lần sau không bao giờ thử lại
-            bad_pos = list(self.particles[self.current_particle_idx].position)
-            self.blacklist.append(bad_pos)
-            self._save_memory()  # Lưu ngay blacklist vào ổ đĩa
-            self.get_logger().warn(
-                f'  ⚠️ Cá thể #{self.current_particle_idx + 1} làm ngã xe (Pitch = {math.degrees(pitch):.1f}°)! '
-                f'Đã đưa vào Blacklist 🚫'
-            )
+            self._add_to_blacklist(f'NGÃ XE (Pitch={math.degrees(pitch):.1f}°)')
+            self._handle_seed_champion_failure()
             self._evaluate_and_next_particle(timestamp)
             return
 
@@ -446,15 +524,10 @@ class PsoPIDTunerNode(Node):
         if self.robot_fell or len(self.pitch_history) < 10 or final_pitch_deg > 4.5:
             fitness = 0.0
             if final_pitch_deg > 4.5 and not self.robot_fell:
-                bad_pos = list(particle.position)
-                self.blacklist.append(bad_pos)
-                self._save_memory()  # Lưu ngay blacklist vào ổ đĩa
-                self.get_logger().warn(
-                    f'    ⚠️ Hết giờ nhưng xe chưa hồi phục (Góc cuối = {final_pitch_deg:.1f}° > 4.5°)! Bị loại 🚫'
-                )
+                self._add_to_blacklist(f'KHÔNG HỒI PHỤC (Góc cuối={final_pitch_deg:.1f}° > 4.5°)')
             rms_deg = 45.0
             mp_deg = 45.0
-            ts_sec = 2.8
+            ts_sec = self.recovery_duration
             ess_deg = 45.0
             itae = 100.0
             chatter = 1.0
@@ -489,12 +562,7 @@ class PsoPIDTunerNode(Node):
             # Phát hiện xe trôi bạt mạng liên tục (tốc độ trung bình >= 1.4 m/s kịch trần) -> Loại!
             if avg_drift >= 1.4:
                 fitness = 0.0
-                bad_pos = list(particle.position)
-                self.blacklist.append(bad_pos)
-                self._save_memory()
-                self.get_logger().warn(
-                    f'    ⚠️ Bị loại do TRÔI BẠT MẠNG LIÊN TỤC (Tốc độ trôi TB = {avg_drift:.2f} m/s >= 1.4 m/s)! Đã vào Blacklist 🚫'
-                )
+                self._add_to_blacklist(f'TRÔI LIÊN TỤC (Drift TB={avg_drift:.2f} m/s >= 1.4)')
             else:
                 # CÔNG THỨC FITNESS TỔNG HỢP CHUẨN ĐIỀU KHIỂN HỌC (THANG 100 ĐIỂM)
                 # Đánh giá toàn diện: RMS, Vọt lố Mp, Thời gian Ts, ITAE, Trôi Drift, Rung Chattering

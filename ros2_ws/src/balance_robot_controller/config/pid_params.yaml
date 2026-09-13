@@ -57,5 +57,11 @@ pid_tuner:
     balance_duration: 4.5       # Thời gian kiểm tra đứng yên (giây, tăng lên 4.5s)
     recovery_duration: 4.5      # Thời gian kiểm tra phục hồi sau huých (giây, tăng lên 4.5s)
 
+    # --- Bộ nhớ học AI ---
+    # Nếu robot ngã ngay từ đầu sau 2-3 lần tuning, đặt reset_memory: true
+    # để xóa sạch bộ nhớ bị nhiễm độc và bắt đầu lại từ PID mặc định.
+    # Sau khi chạy 1 lần thành công, đổi lại thành false.
+    reset_memory: false
+
     # --- Lưu kết quả ---
     output_file: '~/tuned_pid_params.yaml'
