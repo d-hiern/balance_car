@@ -50,7 +50,10 @@ class Particle:
     def __init__(self, bounds, initial_pos=None):
         self.bounds = bounds
         if initial_pos is not None:
-            self.position = list(initial_pos)
+            self.position = [
+                max(bounds[i][0], min(bounds[i][1], initial_pos[i]))
+                for i in range(len(bounds))
+            ]
         else:
             self.position = [random.uniform(b[0], b[1]) for b in bounds]
         self.velocity = [
@@ -281,13 +284,19 @@ class PIDTunerNode(Node):
         gyro_y = msg.angular_velocity.y
         timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
-        if self.state_start_time is None:
+        if self.state_start_time is None or elapsed < 0:
             self.state_start_time = timestamp
-        elapsed = timestamp - self.state_start_time
+            elapsed = 0.0
 
         # ============ PHA 1: RELAY FEEDBACK ============
 
         if self.state == self.STATE_RELAY_STABILIZE:
+            if abs(pitch) > self.fall_threshold:
+                self.publish_cmd_vel(0.0)
+                if elapsed > 1.0:
+                    self.trigger_gazebo_reset()
+                    self.state_start_time = timestamp
+                return
             out = 58.0 * pitch + 6.5 * gyro_y
             self.publish_cmd_vel(out)
             if elapsed < 2.0:
@@ -306,6 +315,7 @@ class PIDTunerNode(Node):
                 self.get_logger().info('')
             elif elapsed > 5.0:
                 self.get_logger().warn('  🔄 Robot chưa đứng! Reset Gazebo...')
+                self.publish_cmd_vel(0.0)
                 self.trigger_gazebo_reset()
                 self.state_start_time = timestamp
             return
@@ -336,6 +346,7 @@ class PIDTunerNode(Node):
             self.relay_last_pitch = pitch
 
             if abs(pitch) > self.fall_threshold:
+                self.publish_cmd_vel(0.0)
                 self.get_logger().warn('  ⚠️ Ngã khi relay! Dùng PID mặc định.')
                 self.zn_kp = self.SAFE_DEFAULT_PID[0]
                 self.zn_ki = self.SAFE_DEFAULT_PID[1]
@@ -362,11 +373,18 @@ class PIDTunerNode(Node):
 
         if abs(pitch) > self.fall_threshold and self.state not in [self.STATE_PSO_RESET, self.STATE_DONE]:
             self.robot_fell = True
+            self.publish_cmd_vel(0.0)
             self._add_to_blacklist(f'NGÃ (Pitch={math.degrees(pitch):.1f}°)')
             self._evaluate_and_next_particle(timestamp)
             return
 
         if self.state == self.STATE_PSO_RESET:
+            if abs(pitch) > self.fall_threshold:
+                self.publish_cmd_vel(0.0)
+                if elapsed > 1.0:
+                    self.trigger_gazebo_reset()
+                    self.state_start_time = timestamp
+                return
             out = self.zn_kp * pitch + self.zn_kd * gyro_y
             self.publish_cmd_vel(out)
             if elapsed < 2.0:
@@ -389,11 +407,6 @@ class PIDTunerNode(Node):
             self.chattering_diffs.append(abs(output - self.prev_output))
             self.prev_output = output
 
-            if elapsed > 0.5 and abs(output) >= 1.5:
-                self.robot_fell = True
-                self._add_to_blacklist('TRÔI (>= 1.5 m/s)')
-                self._evaluate_and_next_particle(timestamp)
-                return
             if elapsed > self.balance_duration:
                 self.state = self.STATE_PSO_DISTURB_FWD
                 self.state_start_time = timestamp
@@ -427,11 +440,6 @@ class PIDTunerNode(Node):
             self.itae_fwd += elapsed * abs(pitch) * 0.01
             if abs(pitch) < 0.026 and self.settling_time_fwd >= self.recovery_duration and elapsed > 0.2:
                 self.settling_time_fwd = elapsed
-            if elapsed > 0.8 and abs(output) >= 1.5:
-                self.robot_fell = True
-                self._add_to_blacklist('TRÔI SAU HUÝCH TIẾN')
-                self._evaluate_and_next_particle(timestamp)
-                return
             if elapsed > self.recovery_duration:
                 self.state = self.STATE_PSO_DISTURB_BWD
                 self.state_start_time = timestamp
@@ -465,11 +473,6 @@ class PIDTunerNode(Node):
             self.itae_bwd += elapsed * abs(pitch) * 0.01
             if abs(pitch) < 0.026 and self.settling_time_bwd >= self.recovery_duration and elapsed > 0.2:
                 self.settling_time_bwd = elapsed
-            if elapsed > 0.8 and abs(output) >= 1.5:
-                self.robot_fell = True
-                self._add_to_blacklist('TRÔI SAU HUÝCH LÙI')
-                self._evaluate_and_next_particle(timestamp)
-                return
             if elapsed > self.recovery_duration:
                 self._evaluate_and_next_particle(timestamp)
             return
@@ -629,14 +632,12 @@ class PIDTunerNode(Node):
             chatter = sum(self.chattering_diffs) / max(1, len(self.chattering_diffs))
             avg_drift = abs(sum(self.output_history) / max(1, len(self.output_history)))
 
-            if avg_drift >= 1.4:
-                fitness = 0.0
-                self._add_to_blacklist(f'TRÔI (Drift={avg_drift:.2f})')
-            elif self.current_generation < self.max_generations:
+            if self.current_generation < self.max_generations:
                 # Fitness ĐƠN GIẢN (thế hệ 1, 2)
                 time_score = min(standing / total, 1.0) * 70.0
                 rms_score = max(0.0, (1.0 - rms_deg / 5.0)) * 30.0
-                fitness = time_score + rms_score
+                drift_penalty = max(0.0, (avg_drift - 0.8) * 15.0)
+                fitness = max(5.0, time_score + rms_score - drift_penalty)
             else:
                 # Fitness IEEE (thế hệ cuối)
                 penalty = (
