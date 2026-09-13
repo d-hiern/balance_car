@@ -5,11 +5,11 @@ Sử dụng:
     ros2 launch balance_robot_controller tuning.launch.py
 
 Tuner sẽ:
-1. Ổn định robot
-2. Áp dụng relay feedback
-3. Đo dao động → tính Ku, Tu
-4. Tính Kp, Ki, Kd theo Ziegler-Nichols
-5. Kiểm nghiệm kết quả
+1. Nạp bộ nhớ học (Warm Start) từ ~/.pso_pid_memory.json
+2. Khởi tạo bầy đàn PSO (6 hạt, né vùng Blacklist)
+3. Chạy kiểm định IEEE: Tĩnh → Huých TIẾN → Hồi phục → Huých LÙI → Hồi phục
+4. Chấm điểm fitness (ITAE + Overshoot + Settling Time + Chattering + Drift)
+5. Lặp qua nhiều thế hệ, hội tụ về bộ PID tối ưu
 6. Lưu file ~/tuned_pid_params.yaml
 
 Yêu cầu: Gazebo phải đang chạy với robot đã spawn.

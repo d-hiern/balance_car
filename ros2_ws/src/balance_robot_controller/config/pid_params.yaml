@@ -53,5 +53,9 @@ pid_tuner:
     fall_threshold: 0.785       # Ngưỡng ngã (rad, ~45 độ)
     max_velocity: 1.5           # Vận tốc tối đa (m/s)
 
+    # --- Thời gian thử nghiệm (Tăng thời gian để phát hiện PID ngã chậm) ---
+    balance_duration: 4.5       # Thời gian kiểm tra đứng yên (giây, tăng lên 4.5s)
+    recovery_duration: 4.5      # Thời gian kiểm tra phục hồi sau huých (giây, tăng lên 4.5s)
+
     # --- Lưu kết quả ---
     output_file: '~/tuned_pid_params.yaml'

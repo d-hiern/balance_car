@@ -93,10 +93,13 @@ class PsoPIDTunerNode(Node):
     ROS 2 Node thực thi thuật toán PSO có Trí nhớ vĩnh viễn (Memory Persistence).
     """
 
+    # ===== CÁC PHA KIỂM ĐỊNH ĐIỀU KHIỂN HỌC (IEEE CONTROL BENCHMARK) =====
     STATE_RESET = 'RESET'
-    STATE_BALANCE = 'BALANCE'         # Kiểm tra đứng yên
-    STATE_DISTURBANCE = 'DISTURB'     # Tác dụng xung lực
-    STATE_RECOVERY = 'RECOVERY'       # Đo phản hồi hồi phục
+    STATE_STATIC = 'STATIC'             # 1. Kiểm định độ ổn định tĩnh & độ êm (2.5s)
+    STATE_DISTURB_FWD = 'DISTURB_FWD'   # 2. Xung huých TIẾN (+0.18 m/s, 0.10s)
+    STATE_RECOVER_FWD = 'RECOVER_FWD'   # 3. Đo hồi phục TIẾN: Ts, Mp, ITAE (3.0s)
+    STATE_DISTURB_BWD = 'DISTURB_BWD'   # 4. Xung huých LÙI (-0.18 m/s, 0.10s)
+    STATE_RECOVER_BWD = 'RECOVER_BWD'   # 5. Đo hồi phục LÙI: Ts, Mp, ITAE (3.0s)
     STATE_DONE = 'DONE'
 
     # Không gian tìm kiếm 4 chiều: [Kp, Ki, Kd, Target_Pitch]
@@ -115,6 +118,8 @@ class PsoPIDTunerNode(Node):
         self.declare_parameter('max_generations', 3)
         self.declare_parameter('fall_threshold', 0.785)
         self.declare_parameter('max_velocity', 1.5)
+        self.declare_parameter('balance_duration', 4.5)     # Thời gian thử đứng yên (tăng lên 4.5s)
+        self.declare_parameter('recovery_duration', 4.5)    # Thời gian thử sau huých (tăng lên 4.5s)
         self.declare_parameter('memory_file', '~/.pso_pid_memory.json')
         self.declare_parameter('output_file', '~/tuned_pid_params.yaml')
 
@@ -122,6 +127,8 @@ class PsoPIDTunerNode(Node):
         self.max_generations = self.get_parameter('max_generations').value
         self.fall_threshold = self.get_parameter('fall_threshold').value
         self.max_velocity = self.get_parameter('max_velocity').value
+        self.balance_duration = self.get_parameter('balance_duration').value
+        self.recovery_duration = self.get_parameter('recovery_duration').value
         self.memory_file = os.path.expanduser(self.get_parameter('memory_file').value)
         self.output_file = os.path.expanduser(self.get_parameter('output_file').value)
 
@@ -227,6 +234,17 @@ class PsoPIDTunerNode(Node):
         twist.linear.x = max(-self.max_velocity, min(self.max_velocity, linear_x))
         self.cmd_vel_pub.publish(twist)
 
+    def _handle_runaway_fail(self, timestamp):
+        """Xử lý loại cá thể khi trôi bạt mạng kịch trần."""
+        self.robot_fell = True
+        bad_pos = list(self.particles[self.current_particle_idx].position)
+        self.blacklist.append(bad_pos)
+        self._save_memory()
+        self.get_logger().warn(
+            f'  ⚠️ Cá thể #{self.current_particle_idx + 1} bị TRÔI MẤT KIỂM SOÁT kịch trần (>= 1.5 m/s)! Đã đưa vào Blacklist 🚫'
+        )
+        self._evaluate_and_next_particle(timestamp)
+
     def imu_callback(self, msg):
         """Xử lý điều khiển và thu thập dữ liệu."""
         pitch = quaternion_to_pitch(msg.orientation)
@@ -262,82 +280,123 @@ class PsoPIDTunerNode(Node):
                 self._start_particle_trial(timestamp)
 
         # ============================================================
-        # 2. STATE: BALANCE (Kiểm tra đứng yên 2.0s)
+        # 2. STATE: STATIC (1. Kiểm định độ ổn định tĩnh & rung giật 2.5s)
         # ============================================================
-        elif self.state == self.STATE_BALANCE:
+        elif self.state == self.STATE_STATIC:
             error = pitch - self.current_target_pitch
             output = self.current_pid.compute(error, timestamp, measured_rate=gyro_y)
             self.publish_cmd_vel(output)
 
             self.pitch_history.append(pitch)
+            self.static_pitch_history.append(pitch)
             self.output_history.append(output)
+            self.chattering_diffs.append(abs(output - self.prev_output))
+            self.prev_output = output
 
-            # Phát hiện xe bị TRÔI MẤT KIỂM SOÁT để đuổi theo góc (v >= 1.5 m/s kịch trần)
             if elapsed > 0.5 and abs(output) >= 1.5:
-                self.robot_fell = True
-                bad_pos = list(self.particles[self.current_particle_idx].position)
-                self.blacklist.append(bad_pos)
-                self._save_memory()
-                self.get_logger().warn(
-                    f'  ⚠️ Cá thể #{self.current_particle_idx + 1} bị TRÔI MẤT KIỂM SOÁT '
-                    f'(Vận tốc chạy đuổi góc = {abs(output):.2f} m/s >= 1.5 m/s)! Đã đưa vào Blacklist 🚫'
-                )
-                self._evaluate_and_next_particle(timestamp)
+                self._handle_runaway_fail(timestamp)
                 return
 
-            if elapsed > 2.0:
-                self.state = self.STATE_DISTURBANCE
+            if elapsed > self.balance_duration:
+                self.state = self.STATE_DISTURB_FWD
                 self.state_start_time = timestamp
-                self.get_logger().info('    👉 [Lực đẩy]: Tác dụng lực xô thử nghiệm vào xe...')
+                self.get_logger().info('    👉 [Huých 1/2 - TIẾN]: Tác dụng xung lực xô về phía trước (+0.18 m/s)...')
 
         # ============================================================
-        # 3. STATE: DISTURBANCE (Xung lực huých nhẹ trên nền PID đang giữ)
+        # 3. STATE: DISTURB_FWD (2. Xung lực huých TIẾN 0.10s)
         # ============================================================
-        elif self.state == self.STATE_DISTURBANCE:
+        elif self.state == self.STATE_DISTURB_FWD:
             error = pitch - self.current_target_pitch
             pid_out = self.current_pid.compute(error, timestamp, measured_rate=gyro_y)
-            # Thêm lực huých (xung đẩy) vào output để thử phản xạ
             output = pid_out + 0.18
             self.publish_cmd_vel(output)
 
             self.pitch_history.append(pitch)
             self.output_history.append(output)
-            self.max_recovery_pitch = max(self.max_recovery_pitch, abs(pitch))
+            self.chattering_diffs.append(abs(output - self.prev_output))
+            self.prev_output = output
 
             if elapsed > 0.10:
-                self.state = self.STATE_RECOVERY
+                self.state = self.STATE_RECOVER_FWD
                 self.state_start_time = timestamp
+                self.overshoot_fwd = 0.0
 
         # ============================================================
-        # 4. STATE: RECOVERY (Đo phản xạ kéo lại thăng bằng 2.5s)
+        # 4. STATE: RECOVER_FWD (3. Đo phản xạ hồi phục TIẾN: Ts, Mp, ITAE 2.8s)
         # ============================================================
-        elif self.state == self.STATE_RECOVERY:
+        elif self.state == self.STATE_RECOVER_FWD:
             error = pitch - self.current_target_pitch
             output = self.current_pid.compute(error, timestamp, measured_rate=gyro_y)
             self.publish_cmd_vel(output)
 
             self.pitch_history.append(pitch)
             self.output_history.append(output)
-            self.max_recovery_pitch = max(self.max_recovery_pitch, abs(pitch))
+            self.chattering_diffs.append(abs(output - self.prev_output))
+            self.prev_output = output
 
-            # Phát hiện xe trôi bạt mạng sau huých không chịu phanh lại (v >= 1.5 m/s)
+            self.overshoot_fwd = max(self.overshoot_fwd, abs(pitch))
+            self.itae_fwd += elapsed * abs(pitch) * 0.01
+
+            # Settling Time Ts: thời gian kéo góc về an toàn (< 1.5 độ)
+            if abs(pitch) < 0.026 and self.settling_time_fwd >= self.recovery_duration and elapsed > 0.2:
+                self.settling_time_fwd = elapsed
+
             if elapsed > 0.8 and abs(output) >= 1.5:
-                self.robot_fell = True
-                bad_pos = list(self.particles[self.current_particle_idx].position)
-                self.blacklist.append(bad_pos)
-                self._save_memory()
-                self.get_logger().warn(
-                    f'  ⚠️ Cá thể #{self.current_particle_idx + 1} bị TRÔI MẤT KIỂM SOÁT '
-                    f'(Không hãm phanh sau huých: v = {abs(output):.2f} m/s >= 1.5 m/s)! Đã đưa vào Blacklist 🚫'
-                )
-                self._evaluate_and_next_particle(timestamp)
+                self._handle_runaway_fail(timestamp)
                 return
 
-            if elapsed > 2.5:
+            if elapsed > self.recovery_duration:
+                self.state = self.STATE_DISTURB_BWD
+                self.state_start_time = timestamp
+                self.get_logger().info('    👉 [Huých 2/2 - LÙI]: Tác dụng xung lực xô về phía sau (-0.18 m/s)...')
+
+        # ============================================================
+        # 5. STATE: DISTURB_BWD (4. Xung lực huých LÙI 0.10s - Đối xứng 2 chiều)
+        # ============================================================
+        elif self.state == self.STATE_DISTURB_BWD:
+            error = pitch - self.current_target_pitch
+            pid_out = self.current_pid.compute(error, timestamp, measured_rate=gyro_y)
+            output = pid_out - 0.18
+            self.publish_cmd_vel(output)
+
+            self.pitch_history.append(pitch)
+            self.output_history.append(output)
+            self.chattering_diffs.append(abs(output - self.prev_output))
+            self.prev_output = output
+
+            if elapsed > 0.10:
+                self.state = self.STATE_RECOVER_BWD
+                self.state_start_time = timestamp
+                self.overshoot_bwd = 0.0
+
+        # ============================================================
+        # 6. STATE: RECOVER_BWD (5. Đo phản xạ hồi phục LÙI: Ts, Mp, ITAE 2.8s)
+        # ============================================================
+        elif self.state == self.STATE_RECOVER_BWD:
+            error = pitch - self.current_target_pitch
+            output = self.current_pid.compute(error, timestamp, measured_rate=gyro_y)
+            self.publish_cmd_vel(output)
+
+            self.pitch_history.append(pitch)
+            self.output_history.append(output)
+            self.chattering_diffs.append(abs(output - self.prev_output))
+            self.prev_output = output
+
+            self.overshoot_bwd = max(self.overshoot_bwd, abs(pitch))
+            self.itae_bwd += elapsed * abs(pitch) * 0.01
+
+            if abs(pitch) < 0.026 and self.settling_time_bwd >= self.recovery_duration and elapsed > 0.2:
+                self.settling_time_bwd = elapsed
+
+            if elapsed > 0.8 and abs(output) >= 1.5:
+                self._handle_runaway_fail(timestamp)
+                return
+
+            if elapsed > self.recovery_duration:
                 self._evaluate_and_next_particle(timestamp)
 
     def _start_particle_trial(self, timestamp):
-        """Bắt đầu thử nghiệm cá thể hiện tại với mô tả chi tiết hạt giống."""
+        """Bắt đầu thử nghiệm cá thể theo Tiêu chuẩn Kiểm định Điều khiển học."""
         particle = self.particles[self.current_particle_idx]
         kp, ki, kd, target_p = particle.position
 
@@ -351,10 +410,20 @@ class PsoPIDTunerNode(Node):
         self.current_target_pitch = target_p
         self.pitch_history = []
         self.output_history = []
+        self.static_pitch_history = []
+        self.chattering_diffs = []
+        self.prev_output = 0.0
         self.robot_fell = False
-        self.max_recovery_pitch = 0.0
 
-        self.state = self.STATE_BALANCE
+        # Các chỉ số tiêu chuẩn kiểm định IEEE
+        self.overshoot_fwd = 0.0
+        self.overshoot_bwd = 0.0
+        self.settling_time_fwd = self.recovery_duration
+        self.settling_time_bwd = self.recovery_duration
+        self.itae_fwd = 0.0
+        self.itae_bwd = 0.0
+
+        self.state = self.STATE_STATIC
         self.state_start_time = timestamp
 
         if self.current_particle_idx == 0:
@@ -369,15 +438,13 @@ class PsoPIDTunerNode(Node):
         )
 
     def _evaluate_and_next_particle(self, timestamp):
-        """Chấm điểm theo thang điểm 100% chuẩn xác và tiến hóa bầy đàn."""
+        """Tổng hợp và chấm điểm theo Tiêu chuẩn Kiểm định Điều khiển học Quốc tế."""
         particle = self.particles[self.current_particle_idx]
         final_pitch_deg = math.degrees(abs(self.pitch_history[-1])) if self.pitch_history else 45.0
 
         # Nếu đã ngã HOẶC khi hết giờ mà xe vẫn chưa hồi phục (vẫn nghiêng > 4.5° đang trên đà ngã) -> Cho 0 điểm!
         if self.robot_fell or len(self.pitch_history) < 10 or final_pitch_deg > 4.5:
             fitness = 0.0
-            rms_deg = 45.0
-            over_deg = 45.0
             if final_pitch_deg > 4.5 and not self.robot_fell:
                 bad_pos = list(particle.position)
                 self.blacklist.append(bad_pos)
@@ -385,13 +452,41 @@ class PsoPIDTunerNode(Node):
                 self.get_logger().warn(
                     f'    ⚠️ Hết giờ nhưng xe chưa hồi phục (Góc cuối = {final_pitch_deg:.1f}° > 4.5°)! Bị loại 🚫'
                 )
+            rms_deg = 45.0
+            mp_deg = 45.0
+            ts_sec = 2.8
+            ess_deg = 45.0
+            itae = 100.0
+            chatter = 1.0
+            avg_drift = 1.5
         else:
-            rms_pitch = math.sqrt(sum(p**2 for p in self.pitch_history) / len(self.pitch_history))
-            rms_deg = math.degrees(rms_pitch)
-            over_deg = math.degrees(self.max_recovery_pitch)
-            avg_drift = abs(sum(self.output_history) / len(self.output_history))
+            # 1. Sai số xác lập tĩnh (Steady-state error e_ss)
+            n_stat = len(self.static_pitch_history)
+            recent_stat = self.static_pitch_history[-min(50, n_stat):]
+            ess_rad = abs(sum(recent_stat) / max(1, len(recent_stat)))
+            ess_deg = math.degrees(ess_rad)
 
-            # Phát hiện xe trôi bạt mạng liên tục (tốc độ trung bình >= 1.4 m/s kịch trần) -> Loại và đưa vào Blacklist!
+            # 2. Độ vọt lố tối đa 2 chiều (Maximum Overshoot Mp)
+            mp_rad = max(self.overshoot_fwd, self.overshoot_bwd)
+            mp_deg = math.degrees(mp_rad)
+
+            # 3. Thời gian ổn định (Settling Time Ts)
+            ts_sec = max(self.settling_time_fwd, self.settling_time_bwd)
+
+            # 4. Chỉ số tích phân sai số chuẩn quốc tế (ITAE)
+            itae = self.itae_fwd + self.itae_bwd
+
+            # 5. Độ êm mô-tơ (Actuator Health / Chattering Index)
+            chatter = sum(self.chattering_diffs) / max(1, len(self.chattering_diffs))
+
+            # 6. Tốc độ trôi trung bình (Drift)
+            avg_drift = abs(sum(self.output_history) / max(1, len(self.output_history)))
+
+            # 7. Độ rung lắc góc toàn bài (RMS Pitch)
+            rms_rad = math.sqrt(sum(p**2 for p in self.pitch_history) / len(self.pitch_history))
+            rms_deg = math.degrees(rms_rad)
+
+            # Phát hiện xe trôi bạt mạng liên tục (tốc độ trung bình >= 1.4 m/s kịch trần) -> Loại!
             if avg_drift >= 1.4:
                 fitness = 0.0
                 bad_pos = list(particle.position)
@@ -401,9 +496,16 @@ class PsoPIDTunerNode(Node):
                     f'    ⚠️ Bị loại do TRÔI BẠT MẠNG LIÊN TỤC (Tốc độ trôi TB = {avg_drift:.2f} m/s >= 1.4 m/s)! Đã vào Blacklist 🚫'
                 )
             else:
-                # THANG ĐIỂM HÀM MŨ CHUẨN 0 - 100%
-                # Đứng vững (RMS < 1.5°), kháng lực tốt (vọt lố < 5°), ít trôi => Điểm 80 ~ 95/100
-                penalty = (0.05 * rms_deg) + (0.02 * over_deg) + (0.40 * avg_drift)
+                # CÔNG THỨC FITNESS TỔNG HỢP CHUẨN ĐIỀU KHIỂN HỌC (THANG 100 ĐIỂM)
+                # Đánh giá toàn diện: RMS, Vọt lố Mp, Thời gian Ts, ITAE, Trôi Drift, Rung Chattering
+                penalty = (
+                    (0.04 * rms_deg) +
+                    (0.02 * mp_deg) +
+                    (0.12 * ts_sec) +
+                    (0.03 * itae) +
+                    (0.35 * avg_drift) +
+                    (0.40 * chatter)
+                )
                 fitness = 100.0 * math.exp(-penalty)
 
         particle.current_fitness = fitness
@@ -418,12 +520,18 @@ class PsoPIDTunerNode(Node):
             self.global_best_fitness = fitness
             self.global_best_position = list(particle.position)
             star = ' ⭐ (KỶ LỤC MỚI!)'
-            # Lưu ngay vào file nhớ
             self._save_memory()
         else:
             star = ''
 
-        self.get_logger().info(f'    ➜ Độ vững: RMS={rms_deg:.2f}° | Điểm: {fitness:.1f}/100{star}')
+        if fitness > 0:
+            self.get_logger().info(
+                f'    📊 [CHUẨN IEEE]: e_ss={ess_deg:.3f}° | Mp={mp_deg:.1f}° | Ts={ts_sec:.2f}s | '
+                f'ITAE={itae:.2f} | Chatter={chatter:.3f} | Drift={avg_drift:.2f}m/s'
+            )
+            self.get_logger().info(f'    ➜ ĐIỂM TIÊU CHUẨN ĐIỀU KHIỂN: {fitness:.1f} / 100{star}')
+        else:
+            self.get_logger().info(f'    ➜ Điểm: 0.0 / 100 (Không đạt tiêu chuẩn kiểm định)')
 
         # Chuyển cá thể tiếp theo
         self.current_particle_idx += 1
@@ -498,6 +606,12 @@ balance_controller:
     use_gyro_derivative: true
     fall_threshold: 0.785
     enabled: true
+
+    # --- Vòng điều khiển Vận tốc & Vị trí (Chống trôi xe - Cascaded Loop) ---
+    enable_velocity_control: true
+    kp_velocity: 0.08
+    kp_position: 0.015
+    max_pitch_adjustment: 0.06
 """
         try:
             with open(self.output_file, 'w') as f:

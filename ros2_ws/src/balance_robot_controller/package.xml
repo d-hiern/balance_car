@@ -7,7 +7,7 @@
     Bộ điều khiển PID cho xe cân bằng hai bánh (self-balancing robot).
     Bao gồm:
     - PID balance controller (đọc IMU, xuất cmd_vel)
-    - PID auto-tuner (relay feedback + Ziegler-Nichols)
+    - PID auto-tuner (PSO với Trí nhớ Học liên tục + IEEE Benchmark)
     - Hỗ trợ runtime parameter tuning
   </description>
 
