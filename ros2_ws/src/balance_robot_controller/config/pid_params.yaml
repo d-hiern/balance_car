@@ -51,6 +51,7 @@ pid_tuner:
     # --- An toàn & Giới hạn ---
     fall_threshold: 0.785       # Ngưỡng ngã (rad, ~45°)
     max_velocity: 1.5           # Vận tốc tối đa (m/s)
+    disturb_magnitude: 0.12     # Lực huých thử động lực học (m/s)
 
     # --- Thời gian mỗi bài thử nghiệm (giây) ---
     balance_duration: 3.5       # Thời gian kiểm tra đứng yên

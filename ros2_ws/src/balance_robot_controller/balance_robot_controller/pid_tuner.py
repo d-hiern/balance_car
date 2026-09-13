@@ -1,20 +1,23 @@
 """
-PID Auto-Tuner Node - Hệ thống Tự Thích Nghi Dựa Trên Dữ Liệu Đáp Ứng Dao Động
-(Deterministic Oscillation-Based Adaptive Tuner)
+PID Auto-Tuner Node - Hệ thống Tự Động Thử Nghiệm & Tối Ưu Hóa PID Đa Mẫu Thử
+(Anchor-Based Multi-Candidate Adaptive PID Auto-Tuner)
 
-Nguyên lý:
-  - 100% KHOA HỌC & TẤT ĐỊNH - KHÔNG DÙNG SỐ NGẪU NHIÊN.
-  - Mỗi bước lặp, xe được đưa qua quy trình kiểm chuẩn IEEE:
-      [Cân bằng tĩnh] ➔ [Huých TIẾN] ➔ [Hồi phục] ➔ [Huých LÙI] ➔ [Hồi phục]
-  - Thuật toán đo trực tiếp 5 đại lượng dao động thực tế:
-      1. Độ vọt lố cực đại (Mp): Đánh giá độ thiếu/thừa giảm chấn Kd
-      2. Thời gian dập tắt dao động (Ts): Đánh giá độ cứng vững Kp
-      3. Độ rung chấn vi phân (Chatter): Phát hiện Kp/Kd bị quá căng
-      4. Tốc độ trôi xe (Drift): Phát hiện Ki bị dư thừa tích phân
-      5. Độ lệch góc tĩnh (RMS): Đánh giá độ êm khi đứng yên
-  - Tự động "bắt bệnh" và tính toán giải tích trực tiếp lượng bù:
-      ΔKp, ΔKi, ΔKd cho bước tiếp theo.
-  - Hội tụ nhanh chỉ sau 4 - 6 bước lặp (~1.5 phút).
+Nguyên lý hoạt động:
+  1. BẢO TOÀN CẤU HÌNH TỐI ƯU (ANCHOR BASELINE):
+     - Luôn lưu giữ bộ thông số cân bằng tốt nhất làm "mỏ neo gốc" (Anchor).
+     - Không bao giờ bị mất kỷ lục hoặc bị kéo ngã theo các mẫu thử thất bại.
+  2. TẠO CÁC MẪU THỬ ĐA DẠNG THÔNG MINH (MULTI-CANDIDATE EXPLORATION):
+     - Từ mỏ neo tốt nhất, hệ thống tự động sinh ra các mẫu thử đa dạng xoay quanh nó:
+       + Mẫu tăng giảm chấn (Kd+) dập tắt vọt lố sau huých.
+       + Mẫu tăng độ cứng (Kp+) rút ngắn thời gian hồi phục.
+       + Mẫu mềm mại (Kp-, Kd-) chống rung chấn cao tần cho motor.
+       + Mẫu triệt tiêu trôi xe (Ki-, Kd+).
+       + Mẫu cân bằng tổng hợp cao cấp.
+  3. THUẬT TOÁN ĐÁNH GIÁ & CẬP NHẬT KỶ LỤC:
+     - Mẫu nào đạt điểm cao hơn -> Lập tức trở thành KỶ LỤC MỚI & MỎ NEO MỚI!
+     - Mẫu nào bị ngã -> Tự động ghi vào Blacklist để không bao giờ lặp lại; mỏ neo vẫn được bảo toàn.
+  4. LƯU TRỮ BỀN VỮNG:
+     - Tự động ghi nhận vào ~/.pso_pid_memory.json và xuất ra ~/tuned_pid_params.yaml.
 """
 
 import json
@@ -41,7 +44,7 @@ def quaternion_to_pitch(q):
 
 class PIDTunerNode(Node):
     """
-    ROS2 Node: Tinh chỉnh PID thích nghi theo phân tích dao động.
+    ROS2 Node: Tinh chỉnh PID đa mẫu thử xoay quanh mỏ neo tối ưu.
     """
 
     # ===== CÁC TRẠNG THÁI KIỂM ĐỊNH =====
@@ -53,13 +56,13 @@ class PIDTunerNode(Node):
     STATE_RECOVER_BWD = 'RECOVER_BWD'
     STATE_DONE = 'DONE'
 
-    # Điểm xuất phát chuẩn hóa cho xe ~0.93kg
+    # Cấu hình mỏ neo chuẩn hóa xuất phát cho xe ~0.93kg
     DEFAULT_SEED_PID = [55.0, 0.50, 6.0]
 
-    # Giới hạn an toàn vật lý của xe
-    KP_MIN, KP_MAX = 38.0, 85.0
-    KI_MIN, KI_MAX = 0.20, 0.75
-    KD_MIN, KD_MAX = 4.0, 9.5
+    # Giới hạn an toàn vật lý của xe (Ngăn không cho vọt lên 85 gây rung giật ngã)
+    KP_MIN, KP_MAX = 42.0, 72.0
+    KI_MIN, KI_MAX = 0.25, 0.70
+    KD_MIN, KD_MAX = 4.8, 8.5
 
     def __init__(self):
         super().__init__('pid_tuner')
@@ -67,6 +70,7 @@ class PIDTunerNode(Node):
         # ===== Khai báo Parameters =====
         self.declare_parameter('fall_threshold', 0.785)
         self.declare_parameter('max_velocity', 1.5)
+        self.declare_parameter('disturb_magnitude', 0.12)
         self.declare_parameter('balance_duration', 3.5)
         self.declare_parameter('recovery_duration', 3.5)
         self.declare_parameter('max_iterations', 7)
@@ -76,6 +80,7 @@ class PIDTunerNode(Node):
 
         self.fall_threshold = self.get_parameter('fall_threshold').value
         self.max_velocity = self.get_parameter('max_velocity').value
+        self.disturb_magnitude = self.get_parameter('disturb_magnitude').value
         self.balance_duration = self.get_parameter('balance_duration').value
         self.recovery_duration = self.get_parameter('recovery_duration').value
         self.max_iterations = self.get_parameter('max_iterations').value
@@ -83,23 +88,27 @@ class PIDTunerNode(Node):
         self.output_file = os.path.expanduser(self.get_parameter('output_file').value)
         reset_memory = self.get_parameter('reset_memory').value
 
-        # ===== Bộ thông số PID hiện tại đang thử =====
-        self.current_kp = self.DEFAULT_SEED_PID[0]
-        self.current_ki = self.DEFAULT_SEED_PID[1]
-        self.current_kd = self.DEFAULT_SEED_PID[2]
-
-        self.best_pid = None
+        # ===== Cấu hình Mỏ Neo Gốc (Anchor Baseline) & Kỷ Lục Tối Ưu =====
+        self.anchor_pid = list(self.DEFAULT_SEED_PID)
+        self.anchor_fitness = 0.0
+        self.best_pid = list(self.DEFAULT_SEED_PID)
         self.best_fitness = 0.0
         self.best_metrics = None
-        self.history_records = []
+
         self.blacklist = []
-        self.MAX_BLACKLIST_SIZE = 10
+        self.MAX_BLACKLIST_SIZE = 12
 
         if reset_memory:
             self._delete_memory()
             self.get_logger().warn('🗑️  ĐÃ XÓA BỘ NHỚ CŨ (reset_memory=True)!')
         else:
             self._load_memory()
+
+        # Bộ thông số của mẫu thử hiện tại
+        self.current_kp = self.anchor_pid[0]
+        self.current_ki = self.anchor_pid[1]
+        self.current_kd = self.anchor_pid[2]
+        self.current_desc = "Cấu hình xuất phát ban đầu"
 
         # ===== State Machine & Dữ liệu đo lường =====
         self.iteration = 1
@@ -135,39 +144,51 @@ class PIDTunerNode(Node):
         )
 
         self.get_logger().info('')
-        self.get_logger().info('=' * 70)
-        self.get_logger().info('  🔬 HỆ THỐNG TỰ THÍCH NGHI PID THEO DỮ LIỆU ĐÁP ỨNG DAO ĐỘNG')
-        self.get_logger().info('     (Deterministic Oscillation-Based Adaptive Auto-Tuner)')
-        self.get_logger().info('=' * 70)
-        self.get_logger().info(f'  Bộ xuất phát: Kp={self.current_kp:.2f} | Ki={self.current_ki:.4f} | Kd={self.current_kd:.2f}')
-        self.get_logger().info(f'  Tối đa {self.max_iterations} bước lặp thích nghi (dừng khi hội tụ)')
-        self.get_logger().info('=' * 70)
+        self.get_logger().info('=' * 72)
+        self.get_logger().info('  🚀 HỆ THỐNG TỰ THÍCH NGHI PID THEO MẪU THỬ QUANH MỎ NEO TỐI ƯU')
+        self.get_logger().info('     (Anchor-Based Multi-Candidate Adaptive PID Auto-Tuner)')
+        self.get_logger().info('=' * 72)
+        self.get_logger().info(
+            f'  ⚓ Mỏ neo xuất phát: Kp={self.anchor_pid[0]:.2f} | Ki={self.anchor_pid[1]:.4f} | Kd={self.anchor_pid[2]:.2f}'
+        )
+        if self.best_fitness > 0.0:
+            self.get_logger().info(f'  ⭐ Kỷ lục tối ưu đã lưu giữ: {self.best_fitness:.1f}%')
+        self.get_logger().info(f'  🎯 Tổng cộng: {self.max_iterations} mẫu thử nghiệm thông minh')
+        self.get_logger().info(f'  💨 Lực huých kiểm tra động lực: ±{self.disturb_magnitude:.2f} m/s')
+        self.get_logger().info('=' * 72)
         self.get_logger().info('')
 
     # ====================== BỘ NHỚ LƯU TRỮ ======================
 
     def _load_memory(self):
+        """Nạp kỷ lục tốt nhất và danh sách cấm ngã (Blacklist) từ file bền vững."""
         if os.path.exists(self.memory_file):
             try:
                 with open(self.memory_file, 'r') as f:
                     data = json.load(f)
-                    pos = data.get('global_best_position')
                     fit = data.get('global_best_fitness', 0.0)
-                    if pos and len(pos) >= 2 and pos[0] >= self.KP_MIN and fit >= 50.0:
-                        self.current_kp = float(pos[0])
-                        self.current_kd = float(pos[1])
-                        if len(pos) >= 3:
-                            self.current_ki = max(self.KI_MIN, min(self.KI_MAX, float(pos[2])))
-                        elif 'zn_ki' in data:
-                            self.current_ki = max(self.KI_MIN, min(self.KI_MAX, float(data['zn_ki'])))
-                        # Chỉ dùng bộ số cũ làm điểm xuất phát thử nghiệm, không coi là best trước khi test
-                        self.best_pid = None
-                        self.best_fitness = 0.0
+                    zn_kp = data.get('zn_kp')
+                    zn_kd = data.get('zn_kd')
+                    zn_ki = data.get('zn_ki')
+                    pos = data.get('global_best_position')
+
+                    kp = zn_kp if zn_kp is not None else (pos[0] if pos and len(pos) >= 2 else None)
+                    kd = zn_kd if zn_kd is not None else (pos[1] if pos and len(pos) >= 2 else None)
+                    ki = zn_ki if zn_ki is not None else 0.50
+
+                    if kp is not None and kd is not None and fit >= 40.0:
+                        kp = max(self.KP_MIN, min(self.KP_MAX, float(kp)))
+                        ki = max(self.KI_MIN, min(self.KI_MAX, float(ki)))
+                        kd = max(self.KD_MIN, min(self.KD_MAX, float(kd)))
+                        self.anchor_pid = [kp, ki, kd]
+                        self.anchor_fitness = fit
+                        self.best_pid = list(self.anchor_pid)
+                        self.best_fitness = fit
                         self.get_logger().info(
-                            f'  📌 Lấy điểm xuất phát từ phiên trước: Kp={self.current_kp:.2f}, Ki={self.current_ki:.4f}, Kd={self.current_kd:.2f} (Kỷ lục cũ: {fit:.1f}%)'
+                            f'  📌 Đã nạp cấu hình tốt nhất từ trước: Kp={kp:.2f}, Ki={ki:.4f}, Kd={kd:.2f} ({fit:.1f}%)'
                         )
                     else:
-                        self.get_logger().warn('  ⚠️ Kỷ lục cũ không đạt chuẩn. Khởi động từ bộ số mặc định!')
+                        self.get_logger().warn('  ⚠️ Kỷ lục cũ không đạt chuẩn. Khởi động từ cấu hình mặc định!')
 
                     loaded_bl = data.get('blacklist', [])
                     self.blacklist = [b for b in loaded_bl if isinstance(b, list) and len(b) >= 3][-self.MAX_BLACKLIST_SIZE:]
@@ -184,8 +205,9 @@ class PIDTunerNode(Node):
                 pass
 
     def _save_memory(self):
+        """Lưu trữ bền vững bộ số tốt nhất."""
         if self.best_pid is None or self.best_fitness <= 0.0:
-            return  # Tuyệt đối không lưu nếu chưa có bộ số nào vượt qua bài test thành công!
+            return
         data = {
             'global_best_position': [self.best_pid[0], self.best_pid[2]],
             'global_best_fitness': self.best_fitness,
@@ -199,6 +221,56 @@ class PIDTunerNode(Node):
                 json.dump(data, f, indent=2)
         except Exception as e:
             self.get_logger().warn(f'Lỗi lưu memory: {e}')
+
+    # ====================== SINH MẪU THỬ THÔNG MINH ======================
+
+    def _get_candidate(self, step_idx):
+        """
+        Tạo các mẫu thử (Candidate variations) xoay quanh mỏ neo tốt nhất (Anchor).
+        Đảm bảo an toàn vật lý và né tránh hoàn toàn Blacklist.
+        """
+        a_kp, a_ki, a_kd = self.anchor_pid
+
+        # Danh mục các định hướng cải tiến xoay quanh Anchor
+        candidates_def = [
+            (0.0,   0.00,  0.0, "Thẩm định cấu hình mỏ neo gốc (Anchor Baseline)"),
+            (0.0,   0.00, +0.6, "Tăng giảm chấn chống vọt lố (Damping +)"),
+            (+3.0,  0.00, +0.4, "Tăng độ cứng rút ngắn thời gian hồi phục (Stiffness +)"),
+            (-3.0,  0.00, -0.3, "Hạ độ cứng giảm rung chấn motor (Smoothness +)"),
+            (+1.5, -0.08, +0.5, "Triệt tiêu trôi xe và dập dao động (Anti-Drift +)"),
+            (+2.5, +0.04, +0.7, "Cân bằng tổng hợp cao cấp (Optimal Balance)"),
+            (-1.5, -0.05, +0.8, "Dập rung sâu gyro và hồi phục êm (Deep Damping)"),
+        ]
+
+        if step_idx - 1 < len(candidates_def):
+            dkp, dki, dkd, desc = candidates_def[step_idx - 1]
+        else:
+            # Nếu chạy nhiều hơn 7 bước, tự dò vi sai thông minh
+            phase = float(step_idx)
+            dkp = 2.5 * math.sin(phase)
+            dkd = 0.5 * math.cos(phase)
+            dki = 0.02 * math.sin(2.0 * phase)
+            desc = f"Mẫu thử thăm dò đa chiều {step_idx}"
+
+        cand_kp = max(self.KP_MIN, min(self.KP_MAX, a_kp + dkp))
+        cand_ki = max(self.KI_MIN, min(self.KI_MAX, a_ki + dki))
+        cand_kd = max(self.KD_MIN, min(self.KD_MAX, a_kd + dkd))
+
+        # Kiểm tra né tránh Blacklist (Tuyệt đối không thử lại vùng từng ngã)
+        for bad in self.blacklist:
+            dist = math.sqrt(
+                ((cand_kp - bad[0]) / (self.KP_MAX - self.KP_MIN)) ** 2 +
+                ((cand_kd - bad[2]) / (self.KD_MAX - self.KD_MIN)) ** 2
+            )
+            if dist < 0.08:
+                shift_kp = 3.0 if cand_kp <= bad[0] else -2.5
+                shift_kd = 0.6 if cand_kd <= bad[2] else -0.5
+                cand_kp = max(self.KP_MIN, min(self.KP_MAX, cand_kp + shift_kp))
+                cand_kd = max(self.KD_MIN, min(self.KD_MAX, cand_kd + shift_kd))
+                desc += f" [🛡️ Đã né Blacklist ({bad[0]:.1f}, {bad[2]:.1f})]"
+                break
+
+        return cand_kp, cand_ki, cand_kd, desc
 
     # ====================== ĐIỀU KHIỂN ROBOT ======================
 
@@ -242,7 +314,7 @@ class PIDTunerNode(Node):
                     self.state_start_time = timestamp
                 return
 
-            # Dùng PD giữ nhẹ trong 2 giây đầu reset
+            # Dùng PD nhẹ hỗ trợ robot dựng thẳng trong 2s
             out = self.current_kp * pitch + self.current_kd * gyro_y
             self.publish_cmd_vel(out)
             if elapsed < 2.0:
@@ -270,14 +342,14 @@ class PIDTunerNode(Node):
             if elapsed > self.balance_duration:
                 self.state = self.STATE_DISTURB_FWD
                 self.state_start_time = timestamp
-                self.get_logger().info('    👉 [Huých TIẾN] +0.18 m/s...')
+                self.get_logger().info(f'    👉 [Huých TIẾN] +{self.disturb_magnitude:.2f} m/s...')
             return
 
         # ----- TRẠNG THÁI 3: HUÝCH TIẾN -----
         if self.state == self.STATE_DISTURB_FWD:
             error = pitch
             pid_out = self.current_pid.compute(error, timestamp, measured_rate=gyro_y)
-            output = pid_out + 0.18
+            output = pid_out + self.disturb_magnitude
             self.publish_cmd_vel(output)
             self.pitch_history.append(pitch)
             self.output_history.append(output)
@@ -316,14 +388,14 @@ class PIDTunerNode(Node):
             if elapsed > self.recovery_duration:
                 self.state = self.STATE_DISTURB_BWD
                 self.state_start_time = timestamp
-                self.get_logger().info('    👉 [Huých LÙI] -0.18 m/s...')
+                self.get_logger().info(f'    👉 [Huých LÙI] -{self.disturb_magnitude:.2f} m/s...')
             return
 
         # ----- TRẠNG THÁI 5: HUÝCH LÙI -----
         if self.state == self.STATE_DISTURB_BWD:
             error = pitch
             pid_out = self.current_pid.compute(error, timestamp, measured_rate=gyro_y)
-            output = pid_out - 0.18
+            output = pid_out - self.disturb_magnitude
             self.publish_cmd_vel(output)
             self.pitch_history.append(pitch)
             self.output_history.append(output)
@@ -364,6 +436,9 @@ class PIDTunerNode(Node):
     # ====================== KHỞI ĐỘNG BÀI THỬ ======================
 
     def _start_iteration_trial(self, timestamp):
+        # Lấy thông số mẫu thử thông minh cho lượt này
+        self.current_kp, self.current_ki, self.current_kd, self.current_desc = self._get_candidate(self.iteration)
+
         self.current_pid = PIDController(
             kp=self.current_kp, ki=self.current_ki, kd=self.current_kd,
             output_min=-self.max_velocity, output_max=self.max_velocity,
@@ -388,11 +463,15 @@ class PIDTunerNode(Node):
         self.state_start_time = timestamp
 
         self.get_logger().info(
-            f'  [Bước lặp {self.iteration}/{self.max_iterations}] 🧪 Thử nghiệm: '
+            f'  [Mẫu thử {self.iteration}/{self.max_iterations}] 🧪 Thử nghiệm: '
             f'Kp={self.current_kp:.2f} | Ki={self.current_ki:.4f} | Kd={self.current_kd:.2f}'
         )
+        self.get_logger().info(f'  ➤ Định hướng mẫu: {self.current_desc}')
+        self.get_logger().info(
+            f'  ➤ Mỏ neo gốc đang giữ: Kp={self.anchor_pid[0]:.2f}, Ki={self.anchor_pid[1]:.4f}, Kd={self.anchor_pid[2]:.2f} (Kỷ lục: {self.best_fitness:.1f}%)'
+        )
 
-    # ====================== PHÂN TÍCH DAO ĐỘNG & TÍNH BÙ TRỪ ======================
+    # ====================== PHÂN TÍCH DAO ĐỘNG & CHẤM ĐIỂM ======================
 
     def _evaluate_iteration(self, timestamp):
         # 1. Đo lường các chỉ số đáp ứng thực tế
@@ -422,8 +501,10 @@ class PIDTunerNode(Node):
             )
             fitness = 100.0 * math.exp(-penalty)
 
-        # Cập nhật kỷ lục tốt nhất: TUYỆT ĐỐI CHỈ CẬP NHẬT KHI ĐỨNG VỮNG VÀ CÓ ĐIỂM DƯƠNG
-        if not self.robot_fell and fitness > self.best_fitness and fitness > 10.0:
+        # 3. Cập nhật kỷ lục tốt nhất và mỏ neo
+        is_new_best = False
+        if not self.robot_fell and fitness > self.best_fitness:
+            is_new_best = True
             self.best_fitness = fitness
             self.best_pid = [self.current_kp, self.current_ki, self.current_kd]
             self.best_metrics = {
@@ -433,160 +514,60 @@ class PIDTunerNode(Node):
                 'drift': avg_drift,
                 'chatter': chatter
             }
+            # Mỏ neo dịch chuyển sang cấu hình vượt trội này
+            self.anchor_pid = list(self.best_pid)
+            self.anchor_fitness = fitness
             self._save_memory()
 
-        # 3. In bảng "Bệnh án" dao động của xe
+        # 4. In bảng "Bệnh án" dao động của mẫu thử
         self.get_logger().info('')
         self.get_logger().info('  ┌─────────────────────────────────────────────────────────────┐')
-        self.get_logger().info(f'  │ 📊 KẾT QUẢ ĐO DAO ĐỘNG [Bước {self.iteration}/{self.max_iterations}]                          │')
+        self.get_logger().info(f'  │ 📊 KẾT QUẢ ĐO DAO ĐỘNG [Mẫu {self.iteration}/{self.max_iterations}]                          │')
         self.get_logger().info('  ├─────────────────────────────────────────────────────────────┤')
         self.get_logger().info(f'  │  PID thử:   Kp={self.current_kp:<7.2f} Ki={self.current_ki:<7.4f} Kd={self.current_kd:<7.2f}    │')
         if not self.robot_fell:
             self.get_logger().info(f'  │  Đáp ứng:   Mp={mp_deg:<5.1f}°  Ts={ts_sec:<5.2f}s  Drift={avg_drift:<5.2f}m/s           │')
             self.get_logger().info(f'  │             RMS={rms_deg:<4.2f}°  Chatter={chatter:<4.2f}  Nhịp lắc={total_ringing:<2d}         │')
             self.get_logger().info(f'  │  Đạt chuẩn: {fitness:>5.1f}% tối ưu  (Kỷ lục: {self.best_fitness:>5.1f}%)                 │')
+            if is_new_best:
+                self.get_logger().info('  │  ⭐ KỶ LỤC MỚI ĐÃ ĐƯỢC THIẾT LẬP! (Cập nhật Mỏ neo gốc)     │')
         else:
             self.get_logger().info(f'  │  Trạng thái: ❌ ROBOT BỊ NGÃ: {self.fall_reason:<28}│')
             self.get_logger().info('  │  Đạt chuẩn:   0.0% tối ưu                                   │')
         self.get_logger().info('  ├─────────────────────────────────────────────────────────────┤')
-        self.get_logger().info('  │ 🧠 PHÂN TÍCH VẬT LÝ & ĐIỀU CHỈNH TỰ THÍCH NGHI:             │')
-
-        # Tính toán tỷ lệ thời gian đứng vững (Survival ratio)
-        standing_time = (timestamp - self.trial_start_time) if self.trial_start_time else 0.0
-        total_test_time = self.balance_duration + 0.1 + self.recovery_duration + 0.1 + self.recovery_duration
-        survival_ratio = min(1.0, max(0.0, standing_time / total_test_time))
-
-        # 4. Thuật toán phân tích giải tích tính ΔKp, ΔKi, ΔKd dựa trên ĐIỂM THÍCH NGHI & ĐỘ THIẾU HỤT
-        delta_kp = 0.0
-        delta_ki = 0.0
-        delta_kd = 0.0
-        reasons = []
+        self.get_logger().info('  │ 🧠 PHÂN TÍCH VẬT LÝ & ĐIỀU PHỐI MẪU THỬ:                    │')
 
         if self.robot_fell:
-            # Ghi nhận bộ số bị ngã vào Blacklist để không bao giờ lặp lại
             bad_entry = [round(self.current_kp, 2), round(self.current_ki, 4), round(self.current_kd, 2)]
             if not any(abs(b[0] - bad_entry[0]) < 1.0 and abs(b[2] - bad_entry[2]) < 0.3 for b in self.blacklist):
                 self.blacklist.append(bad_entry)
                 self.blacklist = self.blacklist[-self.MAX_BLACKLIST_SIZE:]
                 self._save_memory()
             self.get_logger().warn(f'  🚫 Đã thêm bộ số bị ngã vào Blacklist: Kp={bad_entry[0]:.2f}, Kd={bad_entry[2]:.2f}')
-
-            # TÍNH TOÁN ĐỘ THIẾU HỤT DỰA TRÊN TỶ LỆ THỜI GIAN ĐỨNG VỮNG (SURVIVAL RATIO)
-            deficit = 1.0 - survival_ratio  # deficit = 1.0 nếu ngã ngay lập tức, deficit = 0.2 nếu ngã ở giây cuối
-            delta_kp = 14.0 * deficit + 2.5
-            delta_kd = 2.2 * deficit + 0.5
-            delta_ki = -0.15 * deficit
-            reasons.append(
-                f"Ngã tại t={standing_time:.1f}s (đạt {survival_ratio*100:.0f}% bài thi) ➔ "
-                f"Bù thiếu hụt: ΔKp=+{delta_kp:.2f}, ΔKd=+{delta_kd:.2f}"
+            self.get_logger().info(
+                f'  │  • Mẫu thử thất bại ➔ Bảo toàn Mỏ neo gốc: Kp={self.anchor_pid[0]:.2f}, Kd={self.anchor_pid[2]:.2f}   │'
             )
+            self.get_logger().info('  │  • Chuyển sang mẫu thử tiếp theo trong không gian an toàn    │')
         else:
-            # TÍNH TOÁN THEO HÀM ĐIỂM THÍCH NGHI (FITNESS GAP)
-            # Điểm càng thấp -> Độ lệch càng lớn -> Lượng bù càng lớn
-            # Điểm càng cao (ví dụ > 85) -> Bước tinh chỉnh càng nhỏ và mịn
-            fitness_gap = max(0.05, (100.0 - fitness) / 100.0)
-
-            # --- Phân tích Giảm Chấn Kd (Dựa trên Độ vọt lố Mp & Tỷ lệ điểm trừ) ---
-            target_mp = 4.5  # Ngưỡng vọt lố lý tưởng <= 4.5 độ
-            if mp_deg > target_mp or total_ringing >= 2:
-                mp_err = (mp_deg - target_mp) / 5.0
-                d_kd = 1.8 * fitness_gap * max(0.3, mp_err) + (0.3 if total_ringing >= 3 else 0.0)
-                d_kd = min(1.5, max(0.2, d_kd))
-                delta_kd += d_kd
-                reasons.append(f"Vọt lố Mp={mp_deg:.1f}° (Gap={fitness_gap*100:.0f}%) ➔ Bù giảm chấn: ΔKd=+{d_kd:.2f}")
-            elif mp_deg <= 3.5 and chatter > 0.06:
-                d_kd = 0.6 * fitness_gap * ((chatter - 0.05) / 0.08)
-                d_kd = min(0.45, max(0.15, d_kd))
-                delta_kd -= d_kd
-                reasons.append(f"Rung chấn motor (Chatter={chatter:.2f}) ➔ Giảm nhẹ Kd: ΔKd=-{d_kd:.2f}")
-
-            # --- Phân tích Độ Cứng Vững Kp (Dựa trên Thời gian hồi phục Ts & Điểm thích nghi) ---
-            target_ts = 0.55  # Thời gian hồi phục lý tưởng <= 0.55s
-            if ts_sec > target_ts:
-                ts_err = (ts_sec - target_ts) / 1.2
-                d_kp = 10.0 * fitness_gap * max(0.3, ts_err)
-                d_kp = min(7.0, max(1.5, d_kp))
-                delta_kp += d_kp
-                reasons.append(f"Hồi phục chậm Ts={ts_sec:.2f}s (Gap={fitness_gap*100:.0f}%) ➔ Tăng độ cứng: ΔKp=+{d_kp:.2f}")
-            elif chatter > 0.10:
-                d_kp = 6.0 * fitness_gap * ((chatter - 0.08) / 0.12)
-                d_kp = min(4.5, max(1.5, d_kp))
-                delta_kp -= d_kp
-                reasons.append(f"Căng cứng rung cao tần (Chatter={chatter:.2f}) ➔ Hạ Kp: ΔKp=-{d_kp:.2f}")
-
-            # --- Phân tích Tích Phân Ki (Dựa trên Tốc độ trôi xe Drift & Sai số tĩnh) ---
-            target_drift = 0.20  # Tốc độ trôi cho phép <= 0.20 m/s
-            if avg_drift > target_drift:
-                drift_err = (avg_drift - target_drift) / 0.8
-                d_ki = 0.22 * fitness_gap * max(0.3, drift_err)
-                d_ki = min(0.18, max(0.04, d_ki))
-                delta_ki -= d_ki
-                reasons.append(f"Trôi xe Drift={avg_drift:.2f}m/s ➔ Giảm tích phân: ΔKi=-{d_ki:.3f}")
-            elif avg_drift < 0.12 and rms_deg > 1.0:
-                d_ki = 0.08 * fitness_gap
-                delta_ki += d_ki
-                reasons.append(f"Khử lệch tĩnh (RMS={rms_deg:.2f}°) ➔ Bổ sung Ki: ΔKi=+{d_ki:.3f}")
-            elif avg_drift < 0.15 and rms_deg < 0.6:
-                reasons.append("Vị trí và độ thăng bằng đạt chuẩn ➔ Giữ nguyên Ki")
-
-        # 5. Cập nhật bộ thông số cho bước tiếp theo (Kẹp trong biên an toàn)
-        next_kp = max(self.KP_MIN, min(self.KP_MAX, self.current_kp + delta_kp))
-        next_ki = max(self.KI_MIN, min(self.KI_MAX, self.current_ki + delta_ki))
-        next_kd = max(self.KD_MIN, min(self.KD_MAX, self.current_kd + delta_kd))
-
-        # 5b. Kiểm tra né tránh Blacklist (Tuyệt đối không lặp lại vùng từng bị ngã)
-        for bad in self.blacklist:
-            dist = math.sqrt(
-                ((next_kp - bad[0]) / (self.KP_MAX - self.KP_MIN)) ** 2 +
-                ((next_kd - bad[2]) / (self.KD_MAX - self.KD_MIN)) ** 2
-            )
-            if dist < 0.08:  # Quá gần điểm ngã cũ
-                shift_kp = 4.0 if next_kp <= bad[0] else 2.0
-                shift_kd = 0.8 if next_kd <= bad[2] else 0.4
-                orig_kp, orig_kd = next_kp, next_kd
-                next_kp = max(self.KP_MIN, min(self.KP_MAX, next_kp + shift_kp))
-                next_kd = max(self.KD_MIN, min(self.KD_MAX, next_kd + shift_kd))
-                reasons.append(f"Gần Blacklist ({bad[0]:.1f}, {bad[2]:.1f}) ➔ Né sang Kp={next_kp:.2f}, Kd={next_kd:.2f}")
-                self.get_logger().warn(
-                    f'  🛡️ Né tránh Blacklist: Bộ số gần điểm ngã cũ ({bad[0]:.1f}, {bad[2]:.1f}) '
-                    f'➔ Dịch chuyển an toàn từ ({orig_kp:.2f}, {orig_kd:.2f}) sang ({next_kp:.2f}, {next_kd:.2f})'
+            if is_new_best:
+                self.get_logger().info(
+                    f'  │  • Mẫu thử vượt trội ({fitness:.1f}%) ➔ Đã lưu làm Kỷ Lục Mới!          │'
                 )
-                break
+            else:
+                self.get_logger().info(
+                    f'  │  • Mẫu thử ổn định ({fitness:.1f}%) nhưng chưa vượt qua Kỷ Lục ({self.best_fitness:.1f}%) │'
+                )
 
-        # In các lý do điều chỉnh
-        if not reasons:
-            reasons.append("Tất cả các chỉ số đều đạt mức lý tưởng!")
-        for r in reasons:
-            self.get_logger().info(f'  │  • {r:<57}│')
-
-        self.get_logger().info('  ├─────────────────────────────────────────────────────────────┤')
-        self.get_logger().info(
-            f'  │  ➜ BƯỚC TIẾP: Kp={next_kp:<7.2f} Ki={next_ki:<7.4f} Kd={next_kd:<7.2f}                 │'
-        )
         self.get_logger().info('  └─────────────────────────────────────────────────────────────┘')
         self.get_logger().info('')
 
-        # 6. Kiểm tra điều kiện hội tụ sớm (Dừng nếu đã tối ưu)
-        converged = (
-            not self.robot_fell
-            and fitness >= 82.0
-            and abs(delta_kp) < 1.0
-            and abs(delta_kd) < 0.20
-            and mp_deg <= 6.5
-            and ts_sec <= 0.75
-            and self.iteration >= 3
-        )
-
-        if converged or self.iteration >= self.max_iterations:
+        # 5. Kiểm tra kết thúc phiên thử
+        if self.iteration >= self.max_iterations:
             self._finish_tuning()
             return
 
-        # Chuẩn bị cho bước lặp tiếp theo
-        self.current_kp = next_kp
-        self.current_ki = next_ki
-        self.current_kd = next_kd
+        # Chuẩn bị cho mẫu thử tiếp theo
         self.iteration += 1
-
         self.state = self.STATE_RESET
         self.state_start_time = timestamp
         self.publish_cmd_vel(0.0)
@@ -598,6 +579,7 @@ class PIDTunerNode(Node):
         self.state = self.STATE_DONE
         self.publish_cmd_vel(0.0)
 
+        # Sử dụng kỷ lục tốt nhất ghi nhận được trong toàn bộ quá trình
         if self.best_pid is not None and self.best_fitness > 0.0:
             kp, ki, kd = self.best_pid[0], self.best_pid[1], self.best_pid[2]
             opt_percent = self.best_fitness
@@ -614,11 +596,11 @@ class PIDTunerNode(Node):
             else:
                 rating = "⭐ YẾU (Cần tinh chỉnh lại)"
         else:
-            # Nếu trong phiên này mọi bộ số đều bị ngã, KHÔNG nhận vơ bộ số ngã làm tối ưu
-            kp, ki, kd = self.DEFAULT_SEED_PID[0], self.DEFAULT_SEED_PID[1], self.DEFAULT_SEED_PID[2]
-            opt_percent = 0.0
-            rating = "❌ CHƯA ĐẠT (Mọi bộ số trong phiên đều bị ngã)"
-            self.get_logger().warn('  ⚠️ Không có bộ số nào vượt qua bài kiểm định thành công trong phiên này!')
+            # Nếu chưa có mẫu nào đạt chuẩn, lấy mỏ neo gốc ban đầu
+            kp, ki, kd = self.anchor_pid[0], self.anchor_pid[1], self.anchor_pid[2]
+            opt_percent = self.anchor_fitness
+            rating = "⚠️ DỰ PHÒNG TỪ MỎ NEO GỐC"
+            self.get_logger().warn('  ⚠️ Phiên này các mẫu thử đều ngã, bảo tồn cấu hình mỏ neo gốc!')
 
         # Điểm thành phần từng tiêu chuẩn kỹ thuật
         if self.best_metrics:
@@ -644,7 +626,7 @@ class PIDTunerNode(Node):
         self.get_logger().info(f'  │  • Tốc độ hồi phục sau huých (Ts): {score_ts:>6.1f}%                   │')
         self.get_logger().info(f'  │  • Khả năng giữ vị trí chống trôi: {score_drift:>6.1f}%                   │')
         self.get_logger().info('  ├────────────────────────────────────────────────────────────┤')
-        self.get_logger().info('  │ 🎯 BỘ THAM SỐ PID TỐI ƯU CUỐI CÙNG:                        │')
+        self.get_logger().info('  │ 🎯 BỘ THAM SỐ PID TỐI ƯU CUỐI CÙNG ĐÃ LƯU:                 │')
         self.get_logger().info('  ├────────────────────────────────────────────────────────────┤')
         self.get_logger().info(f'  │  Kp = {kp:>10.4f}  (Độ cứng vững đàn hồi)               │')
         self.get_logger().info(f'  │  Ki = {ki:>10.4f}  (Triệt tiêu sai số xác lập)          │')
