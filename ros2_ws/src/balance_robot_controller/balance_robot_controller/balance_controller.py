@@ -80,9 +80,9 @@ class BalanceControllerNode(Node):
 
         # --- Vòng điều khiển Vận tốc & Vị trí (Cascaded Loop - Chống trôi xe) ---
         self.declare_parameter('enable_velocity_control', True)
-        self.declare_parameter('kp_velocity', 0.12)
-        self.declare_parameter('kp_position', 0.04)
-        self.declare_parameter('max_pitch_adjustment', 0.087)  # ~5.0 độ
+        self.declare_parameter('kp_velocity', 0.08)           # Giảm chấn vận tốc êm dịu, không giật
+        self.declare_parameter('kp_position', 0.015)          # Lực kéo vị trí nhẹ nhàng, chống lắc lư
+        self.declare_parameter('max_pitch_adjustment', 0.06)  # ~3.5 độ (giới hạn góc ngửa êm ái)
 
         # ===== Lấy giá trị ban đầu =====
         kp = self.get_parameter('kp').value
@@ -221,8 +221,10 @@ class BalanceControllerNode(Node):
         return SetParametersResult(successful=True)
 
     def odom_callback(self, msg):
-        """Callback cập nhật vận tốc và vị trí xe từ Odometry."""
-        self.current_vel_x = msg.twist.twist.linear.x
+        """Callback cập nhật vận tốc và vị trí xe từ Odometry có lọc thông thấp làm mượt."""
+        raw_vel = msg.twist.twist.linear.x
+        # Lọc thông thấp (75% cũ + 25% mới) để triệt tiêu rung giật
+        self.current_vel_x = 0.75 * self.current_vel_x + 0.25 * raw_vel
         self.current_pos_x = msg.pose.pose.position.x
         if self.target_pos_x is None:
             self.target_pos_x = self.current_pos_x
@@ -266,13 +268,22 @@ class BalanceControllerNode(Node):
                 self.get_logger().info('Robot đã dựng lại. Tiếp tục cân bằng.')
                 self.publish_status('RUNNING')
 
-        # ===== Vòng lặp kép Cascaded PID (Chống trôi xe & Tự động hãm phanh) =====
+        # ===== Vòng lặp kép Cascaded PID (Chống trôi xe có Deadband triệt tiêu dao động) =====
         if self.enable_velocity_control and self.target_pos_x is not None:
             vel_error = self.current_vel_x
             pos_error = self.current_pos_x - self.target_pos_x
+
+            # Deadband (Vùng chết dung sai nhỏ):
+            # Nếu xe chỉ nhích siêu nhẹ (< 1.5 cm hoặc < 0.03 m/s) thì coi như đứng yên,
+            # KHÔNG bù góc để triệt tiêu hoàn toàn hiện tượng lắc lư qua lại tại một chỗ!
+            if abs(vel_error) < 0.03:
+                vel_error = 0.0
+            if abs(pos_error) < 0.015:
+                pos_error = 0.0
+
             # Khi xe trôi tới (v > 0) -> bù góc âm (ngửa người ra sau) để hãm phanh
             pitch_adjust = - (self.kp_velocity * vel_error + self.kp_position * pos_error)
-            # Kẹp góc bù an toàn (tối đa ±5 độ) để tuyệt đối không làm ngã xe
+            # Kẹp góc bù an toàn (mặc định tối đa ±3.5 độ)
             pitch_adjust = max(-self.max_pitch_adjustment, min(self.max_pitch_adjustment, pitch_adjust))
         else:
             pitch_adjust = 0.0

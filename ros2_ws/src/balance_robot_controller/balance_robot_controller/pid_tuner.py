@@ -272,6 +272,19 @@ class PsoPIDTunerNode(Node):
             self.pitch_history.append(pitch)
             self.output_history.append(output)
 
+            # Phát hiện xe bị TRÔI MẤT KIỂM SOÁT để đuổi theo góc (v > 0.50 m/s)
+            if elapsed > 0.5 and abs(output) > 0.50:
+                self.robot_fell = True
+                bad_pos = list(self.particles[self.current_particle_idx].position)
+                self.blacklist.append(bad_pos)
+                self._save_memory()
+                self.get_logger().warn(
+                    f'  ⚠️ Cá thể #{self.current_particle_idx + 1} bị TRÔI MẤT KIỂM SOÁT '
+                    f'(Vận tốc chạy đuổi góc = {abs(output):.2f} m/s > 0.50 m/s)! Đã đưa vào Blacklist 🚫'
+                )
+                self._evaluate_and_next_particle(timestamp)
+                return
+
             if elapsed > 2.0:
                 self.state = self.STATE_DISTURBANCE
                 self.state_start_time = timestamp
@@ -307,11 +320,24 @@ class PsoPIDTunerNode(Node):
             self.output_history.append(output)
             self.max_recovery_pitch = max(self.max_recovery_pitch, abs(pitch))
 
+            # Phát hiện xe trôi bạt mạng sau huých không chịu phanh lại (v > 0.60 m/s)
+            if elapsed > 0.8 and abs(output) > 0.60:
+                self.robot_fell = True
+                bad_pos = list(self.particles[self.current_particle_idx].position)
+                self.blacklist.append(bad_pos)
+                self._save_memory()
+                self.get_logger().warn(
+                    f'  ⚠️ Cá thể #{self.current_particle_idx + 1} bị TRÔI MẤT KIỂM SOÁT '
+                    f'(Không hãm phanh sau huých: v = {abs(output):.2f} m/s > 0.60 m/s)! Đã đưa vào Blacklist 🚫'
+                )
+                self._evaluate_and_next_particle(timestamp)
+                return
+
             if elapsed > 2.5:
                 self._evaluate_and_next_particle(timestamp)
 
     def _start_particle_trial(self, timestamp):
-        """Bắt đầu thử nghiệm cá thể hiện tại."""
+        """Bắt đầu thử nghiệm cá thể hiện tại với mô tả chi tiết hạt giống."""
         particle = self.particles[self.current_particle_idx]
         kp, ki, kd, target_p = particle.position
 
@@ -331,10 +357,15 @@ class PsoPIDTunerNode(Node):
         self.state = self.STATE_BALANCE
         self.state_start_time = timestamp
 
+        if self.current_particle_idx == 0:
+            seed_desc = '👑 SEED VÔ ĐỊCH (Kế thừa từ ổ cứng)'
+        else:
+            seed_desc = f'🔍 Hạt thăm dò né Blacklist #{self.current_particle_idx}'
+
         self.get_logger().info(
             f'  [Thế hệ {self.current_generation}/{self.max_generations}] '
-            f'Cá thể #{self.current_particle_idx + 1}: '
-            f'Kp={kp:.2f} | Ki={ki:.3f} | Kd={kd:.2f} | Target={target_p:+.4f}'
+            f'Cá thể #{self.current_particle_idx + 1} [{seed_desc}]:\n'
+            f'     Kp={kp:.2f} | Ki={ki:.3f} | Kd={kd:.2f} | Target={target_p:+.5f} rad ({math.degrees(target_p):.3f}°)'
         )
 
     def _evaluate_and_next_particle(self, timestamp):
@@ -360,10 +391,20 @@ class PsoPIDTunerNode(Node):
             over_deg = math.degrees(self.max_recovery_pitch)
             avg_drift = abs(sum(self.output_history) / len(self.output_history))
 
-            # THANG ĐIỂM HÀM MŨ CHUẨN 0 - 100%
-            # Đứng vững (RMS < 1.5°), kháng lực tốt (vọt lố < 5°), ít trôi => Điểm 80 ~ 95/100
-            penalty = (0.05 * rms_deg) + (0.02 * over_deg) + (0.35 * avg_drift)
-            fitness = 100.0 * math.exp(-penalty)
+            # Phát hiện xe trôi bò liên tục (tốc độ trung bình > 0.28 m/s không đứng yên) -> Loại và đưa vào Blacklist!
+            if avg_drift > 0.28:
+                fitness = 0.0
+                bad_pos = list(particle.position)
+                self.blacklist.append(bad_pos)
+                self._save_memory()
+                self.get_logger().warn(
+                    f'    ⚠️ Bị loại do TRÔI BÒ LIÊN TỤC (Tốc độ trôi TB = {avg_drift:.2f} m/s > 0.28 m/s)! Đã vào Blacklist 🚫'
+                )
+            else:
+                # THANG ĐIỂM HÀM MŨ CHUẨN 0 - 100%
+                # Đứng vững (RMS < 1.5°), kháng lực tốt (vọt lố < 5°), ít trôi => Điểm 80 ~ 95/100
+                penalty = (0.05 * rms_deg) + (0.02 * over_deg) + (0.40 * avg_drift)
+                fitness = 100.0 * math.exp(-penalty)
 
         particle.current_fitness = fitness
 
