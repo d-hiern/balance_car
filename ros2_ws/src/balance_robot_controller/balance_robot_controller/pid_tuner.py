@@ -272,15 +272,15 @@ class PsoPIDTunerNode(Node):
             self.pitch_history.append(pitch)
             self.output_history.append(output)
 
-            # Phát hiện xe bị TRÔI MẤT KIỂM SOÁT để đuổi theo góc (v > 0.50 m/s)
-            if elapsed > 0.5 and abs(output) > 0.50:
+            # Phát hiện xe bị TRÔI MẤT KIỂM SOÁT để đuổi theo góc (v >= 1.5 m/s kịch trần)
+            if elapsed > 0.5 and abs(output) >= 1.5:
                 self.robot_fell = True
                 bad_pos = list(self.particles[self.current_particle_idx].position)
                 self.blacklist.append(bad_pos)
                 self._save_memory()
                 self.get_logger().warn(
                     f'  ⚠️ Cá thể #{self.current_particle_idx + 1} bị TRÔI MẤT KIỂM SOÁT '
-                    f'(Vận tốc chạy đuổi góc = {abs(output):.2f} m/s > 0.50 m/s)! Đã đưa vào Blacklist 🚫'
+                    f'(Vận tốc chạy đuổi góc = {abs(output):.2f} m/s >= 1.5 m/s)! Đã đưa vào Blacklist 🚫'
                 )
                 self._evaluate_and_next_particle(timestamp)
                 return
@@ -320,15 +320,15 @@ class PsoPIDTunerNode(Node):
             self.output_history.append(output)
             self.max_recovery_pitch = max(self.max_recovery_pitch, abs(pitch))
 
-            # Phát hiện xe trôi bạt mạng sau huých không chịu phanh lại (v > 0.60 m/s)
-            if elapsed > 0.8 and abs(output) > 0.60:
+            # Phát hiện xe trôi bạt mạng sau huých không chịu phanh lại (v >= 1.5 m/s)
+            if elapsed > 0.8 and abs(output) >= 1.5:
                 self.robot_fell = True
                 bad_pos = list(self.particles[self.current_particle_idx].position)
                 self.blacklist.append(bad_pos)
                 self._save_memory()
                 self.get_logger().warn(
                     f'  ⚠️ Cá thể #{self.current_particle_idx + 1} bị TRÔI MẤT KIỂM SOÁT '
-                    f'(Không hãm phanh sau huých: v = {abs(output):.2f} m/s > 0.60 m/s)! Đã đưa vào Blacklist 🚫'
+                    f'(Không hãm phanh sau huých: v = {abs(output):.2f} m/s >= 1.5 m/s)! Đã đưa vào Blacklist 🚫'
                 )
                 self._evaluate_and_next_particle(timestamp)
                 return
@@ -391,14 +391,14 @@ class PsoPIDTunerNode(Node):
             over_deg = math.degrees(self.max_recovery_pitch)
             avg_drift = abs(sum(self.output_history) / len(self.output_history))
 
-            # Phát hiện xe trôi bò liên tục (tốc độ trung bình > 0.28 m/s không đứng yên) -> Loại và đưa vào Blacklist!
-            if avg_drift > 0.28:
+            # Phát hiện xe trôi bạt mạng liên tục (tốc độ trung bình >= 1.4 m/s kịch trần) -> Loại và đưa vào Blacklist!
+            if avg_drift >= 1.4:
                 fitness = 0.0
                 bad_pos = list(particle.position)
                 self.blacklist.append(bad_pos)
                 self._save_memory()
                 self.get_logger().warn(
-                    f'    ⚠️ Bị loại do TRÔI BÒ LIÊN TỤC (Tốc độ trôi TB = {avg_drift:.2f} m/s > 0.28 m/s)! Đã vào Blacklist 🚫'
+                    f'    ⚠️ Bị loại do TRÔI BẠT MẠNG LIÊN TỤC (Tốc độ trôi TB = {avg_drift:.2f} m/s >= 1.4 m/s)! Đã vào Blacklist 🚫'
                 )
             else:
                 # THANG ĐIỂM HÀM MŨ CHUẨN 0 - 100%
