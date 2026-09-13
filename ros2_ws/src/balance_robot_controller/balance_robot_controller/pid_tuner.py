@@ -74,7 +74,7 @@ class Particle:
             self.position[i] += self.velocity[i]
             self.position[i] = max(self.bounds[i][0], min(self.bounds[i][1], self.position[i]))
 
-        # Cơ chế Né tránh Vùng Xấu (Tabu Avoidance)
+        # Cơ chế Né tránh Vùng Xấu (Tabu Avoidance) - nhẹ nhàng
         if blacklist:
             for bad_pos in blacklist:
                 # Tính khoảng cách chuẩn hóa tới điểm xấu
@@ -82,10 +82,10 @@ class Particle:
                     ((self.position[k] - bad_pos[k]) / (self.bounds[k][1] - self.bounds[k][0])) ** 2
                     for k in range(len(self.position))
                 )
-                if dist_sq < 0.04:  # Bán kính nguy hiểm (r < 0.2)
-                    # Lực đẩy đẩy hạt bay về phía an toàn (hướng về global_best)
+                if dist_sq < 0.01:  # Bán kính nguy hiểm thu nhỏ (r < 0.1)
+                    # Đẩy nhẹ hạt ra xa vùng xấu (giữ 90% vị trí hiện tại)
                     for k in range(len(self.position)):
-                        self.position[k] = 0.7 * self.position[k] + 0.3 * global_best_pos[k]
+                        self.position[k] = 0.9 * self.position[k] + 0.1 * global_best_pos[k]
 
 
 class PsoPIDTunerNode(Node):
@@ -114,8 +114,8 @@ class PsoPIDTunerNode(Node):
     SAFE_DEFAULT_PID = [58.0, 0.75, 6.5, 0.0]
     # Ngưỡng fitness tối thiểu để coi là "đáng tin cậy" kế thừa
     MIN_TRUSTWORTHY_FITNESS = 15.0
-    # Số điểm blacklist tối đa (tránh phình to gây vòng lặp chết)
-    MAX_BLACKLIST_SIZE = 10
+    # Số điểm blacklist tối đa (ít để tránh bịt kín không gian tìm kiếm)
+    MAX_BLACKLIST_SIZE = 5
 
     def __init__(self):
         super().__init__('pid_tuner')
