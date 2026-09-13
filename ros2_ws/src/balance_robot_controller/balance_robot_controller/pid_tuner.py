@@ -88,7 +88,7 @@ class PIDTunerNode(Node):
         self.current_ki = self.DEFAULT_SEED_PID[1]
         self.current_kd = self.DEFAULT_SEED_PID[2]
 
-        self.best_pid = list(self.DEFAULT_SEED_PID)
+        self.best_pid = None
         self.best_fitness = 0.0
         self.best_metrics = None
         self.history_records = []
@@ -160,13 +160,14 @@ class PIDTunerNode(Node):
                             self.current_ki = max(self.KI_MIN, min(self.KI_MAX, float(pos[2])))
                         elif 'zn_ki' in data:
                             self.current_ki = max(self.KI_MIN, min(self.KI_MAX, float(data['zn_ki'])))
-                        self.best_pid = [self.current_kp, self.current_ki, self.current_kd]
-                        self.best_fitness = fit
+                        # Chỉ dùng bộ số cũ làm điểm xuất phát thử nghiệm, không coi là best trước khi test
+                        self.best_pid = None
+                        self.best_fitness = 0.0
                         self.get_logger().info(
-                            f'  ✅ Kế thừa kỷ lục cũ: Kp={self.current_kp:.2f}, Ki={self.current_ki:.4f}, Kd={self.current_kd:.2f} (Fitness={fit:.1f}/100)'
+                            f'  📌 Lấy điểm xuất phát từ phiên trước: Kp={self.current_kp:.2f}, Ki={self.current_ki:.4f}, Kd={self.current_kd:.2f} (Kỷ lục cũ: {fit:.1f}%)'
                         )
                     else:
-                        self.get_logger().warn('  ⚠️ Kỷ lục cũ không đạt chuẩn (Kp quá yếu hoặc fit thấp). Dùng bộ chuẩn mới!')
+                        self.get_logger().warn('  ⚠️ Kỷ lục cũ không đạt chuẩn. Khởi động từ bộ số mặc định!')
 
                     loaded_bl = data.get('blacklist', [])
                     self.blacklist = [b for b in loaded_bl if isinstance(b, list) and len(b) >= 3][-self.MAX_BLACKLIST_SIZE:]
@@ -183,6 +184,8 @@ class PIDTunerNode(Node):
                 pass
 
     def _save_memory(self):
+        if self.best_pid is None or self.best_fitness <= 0.0:
+            return  # Tuyệt đối không lưu nếu chưa có bộ số nào vượt qua bài test thành công!
         data = {
             'global_best_position': [self.best_pid[0], self.best_pid[2]],
             'global_best_fitness': self.best_fitness,
@@ -419,8 +422,8 @@ class PIDTunerNode(Node):
             )
             fitness = 100.0 * math.exp(-penalty)
 
-        # Cập nhật kỷ lục tốt nhất
-        if fitness > self.best_fitness:
+        # Cập nhật kỷ lục tốt nhất: TUYỆT ĐỐI CHỈ CẬP NHẬT KHI ĐỨNG VỮNG VÀ CÓ ĐIỂM DƯƠNG
+        if not self.robot_fell and fitness > self.best_fitness and fitness > 10.0:
             self.best_fitness = fitness
             self.best_pid = [self.current_kp, self.current_ki, self.current_kd]
             self.best_metrics = {
@@ -594,21 +597,28 @@ class PIDTunerNode(Node):
     def _finish_tuning(self):
         self.state = self.STATE_DONE
         self.publish_cmd_vel(0.0)
-        kp, ki, kd = self.best_pid[0], self.best_pid[1], self.best_pid[2]
-        self._save_memory()
 
-        opt_percent = self.best_fitness
+        if self.best_pid is not None and self.best_fitness > 0.0:
+            kp, ki, kd = self.best_pid[0], self.best_pid[1], self.best_pid[2]
+            opt_percent = self.best_fitness
+            self._save_memory()
 
-        if opt_percent >= 90.0:
-            rating = "⭐⭐⭐⭐⭐ XUẤT SẮC (Gần như hoàn hảo)"
-        elif opt_percent >= 80.0:
-            rating = "⭐⭐⭐⭐ RẤT TỐT (Chuẩn công nghiệp - Vận hành thực tế)"
-        elif opt_percent >= 70.0:
-            rating = "⭐⭐⭐ TỐT (Thăng bằng ổn định, chống nhiễu khá)"
-        elif opt_percent >= 50.0:
-            rating = "⭐⭐ TRUNG BÌNH (Cân bằng được, còn dao động nhẹ)"
+            if opt_percent >= 90.0:
+                rating = "⭐⭐⭐⭐⭐ XUẤT SẮC (Gần như hoàn hảo)"
+            elif opt_percent >= 80.0:
+                rating = "⭐⭐⭐⭐ RẤT TỐT (Chuẩn công nghiệp - Vận hành thực tế)"
+            elif opt_percent >= 70.0:
+                rating = "⭐⭐⭐ TỐT (Thăng bằng ổn định, chống nhiễu khá)"
+            elif opt_percent >= 50.0:
+                rating = "⭐⭐ TRUNG BÌNH (Cân bằng được, còn dao động nhẹ)"
+            else:
+                rating = "⭐ YẾU (Cần tinh chỉnh lại)"
         else:
-            rating = "⭐ YẾU (Cần tinh chỉnh lại)"
+            # Nếu trong phiên này mọi bộ số đều bị ngã, KHÔNG nhận vơ bộ số ngã làm tối ưu
+            kp, ki, kd = self.DEFAULT_SEED_PID[0], self.DEFAULT_SEED_PID[1], self.DEFAULT_SEED_PID[2]
+            opt_percent = 0.0
+            rating = "❌ CHƯA ĐẠT (Mọi bộ số trong phiên đều bị ngã)"
+            self.get_logger().warn('  ⚠️ Không có bộ số nào vượt qua bài kiểm định thành công trong phiên này!')
 
         # Điểm thành phần từng tiêu chuẩn kỹ thuật
         if self.best_metrics:
