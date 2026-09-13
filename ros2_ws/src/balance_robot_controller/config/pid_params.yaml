@@ -40,27 +40,32 @@ balance_controller:
 
 
 # =============================================
-# Cấu hình PID Auto-Tuner
+# Cấu hình PID Auto-Tuner (2 Pha)
 # =============================================
+# Pha 1: Relay Feedback (Ziegler-Nichols) → Tìm PID gần đúng (~15s)
+# Pha 2: PSO Fine-tune 2D (Kp, Kd)      → Tinh chỉnh (~2 phút)
 
 pid_tuner:
   ros__parameters:
-    # --- Cấu hình Thuật toán Tối ưu Bầy đàn (PSO AI) ---
-    num_particles: 6            # Số lượng cá thể trong bầy (tăng lên 6 để khám phá đa dạng hơn)
-    max_generations: 3          # Số thế hệ tiến hóa và hội tụ bầy đàn
-
     # --- An toàn & Giới hạn ---
-    fall_threshold: 0.785       # Ngưỡng ngã (rad, ~45 độ)
+    fall_threshold: 0.785       # Ngưỡng ngã (rad, ~45°)
     max_velocity: 1.5           # Vận tốc tối đa (m/s)
 
-    # --- Thời gian thử nghiệm (Tăng thời gian để phát hiện PID ngã chậm) ---
-    balance_duration: 4.5       # Thời gian kiểm tra đứng yên (giây, tăng lên 4.5s)
-    recovery_duration: 4.5      # Thời gian kiểm tra phục hồi sau huých (giây, tăng lên 4.5s)
+    # --- Pha 1: Relay Feedback (Ziegler-Nichols) ---
+    relay_amplitude: 0.5        # Biên độ relay (m/s). Giảm nếu robot ngã khi relay
+    relay_duration: 12.0        # Thời gian relay tối đa (giây)
+    relay_hysteresis: 0.005     # Ngưỡng hysteresis chống rung (rad, ~0.3°)
+
+    # --- Pha 2: PSO Fine-tune 2D (chỉ tìm Kp, Kd) ---
+    num_particles: 4            # Số hạt PSO (ít hơn vì chỉ 2D)
+    max_generations: 3          # Số thế hệ (gen 1-2: fitness đơn giản, gen 3: IEEE)
+
+    # --- Thời gian thử nghiệm ---
+    balance_duration: 4.5       # Thời gian kiểm tra đứng yên (giây)
+    recovery_duration: 4.5      # Thời gian kiểm tra phục hồi sau huých (giây)
 
     # --- Bộ nhớ học AI ---
-    # Nếu robot ngã ngay từ đầu sau 2-3 lần tuning, đặt reset_memory: true
-    # để xóa sạch bộ nhớ bị nhiễm độc và bắt đầu lại từ PID mặc định.
-    # Sau khi chạy 1 lần thành công, đổi lại thành false.
+    # Nếu robot ngã ngay từ đầu, đặt reset_memory: true để xóa bộ nhớ cũ.
     reset_memory: false
 
     # --- Lưu kết quả ---
